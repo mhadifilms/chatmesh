@@ -1,0 +1,5 @@
+#!/bin/bash
+# chatmesh launcher — works from any checkout location, no install step.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m chatmesh "$@"
