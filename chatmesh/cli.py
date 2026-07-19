@@ -70,6 +70,26 @@ def main(argv=None) -> int:
     p = preference_sub.add_parser("list", help="list safe preference inventory")
     p.add_argument("--json", action="store_true")
     preference_sub.add_parser("conflicts", help="list preference conflict inbox")
+    p = sub.add_parser(
+        "environment", help="inspect additive package and venv synchronization"
+    )
+    environment_sub = p.add_subparsers(dest="environment_cmd", required=True)
+    p = environment_sub.add_parser(
+        "list", help="list package, runtime, tool, and venv inventory"
+    )
+    p.add_argument("--json", action="store_true")
+    p = environment_sub.add_parser(
+        "plan", help="compare environment additions with one peer"
+    )
+    p.add_argument("--peer", required=True)
+    p = environment_sub.add_parser(
+        "apply", help="explicitly apply safe additions in one direction"
+    )
+    p.add_argument("--peer", required=True)
+    p.add_argument("--direction", choices=("pull", "push"), required=True)
+    environment_sub.add_parser(
+        "pending", help="list quarantined environment snapshots and plans"
+    )
 
     sub.add_parser("export-cursor-index")
     p = sub.add_parser("export-cursor-rows")
@@ -128,6 +148,11 @@ def main(argv=None) -> int:
     p.add_argument("--dry-run", action="store_true")
     sub.add_parser("preferences-export")
     sub.add_parser("preferences-apply")
+    sub.add_parser("environment-export")
+    sub.add_parser("environment-plan")
+    p = sub.add_parser("environment-apply")
+    p.add_argument("--peer", required=True)
+    p.add_argument("--force", action="store_true")
 
     args = ap.parse_args(argv)
     try:
@@ -163,9 +188,10 @@ def main(argv=None) -> int:
         print("peers: %s | apps: %s" % (",".join(cfg.peers), ",".join(cfg.apps)))
         for app in cfg.apps:
             print("  %-10s running locally: %s" % (app, app_running_local(app)))
-        print("  git sync: %s | preferences: %s" % (
+        print("  git sync: %s | preferences: %s | environment: %s" % (
             "enabled" if cfg.git.enabled else "disabled",
             "enabled" if cfg.preferences.enabled else "disabled",
+            "enabled" if cfg.environment.enabled else "disabled",
         ))
         for label, relative in (
             ("inbox", "inbox"),
@@ -226,6 +252,8 @@ def main(argv=None) -> int:
         return run_git_command(cfg, args)
     if args.cmd == "preferences":
         return run_preferences_command(cfg, args)
+    if args.cmd == "environment":
+        return run_environment_command(cfg, args)
 
     if args.cmd == "deploy":
         from .sync import ensure_deployed
@@ -336,6 +364,40 @@ def main(argv=None) -> int:
             raise ValueError("preference plan exceeds configured limit")
         plan = json.loads(raw.decode("utf-8"))
         print(json.dumps(apply_preference_plan(cfg, plan), sort_keys=True))
+        return 0
+    if args.cmd == "environment-export":
+        from .environmentops import snapshot_environment
+        if not cfg.environment.enabled:
+            raise ValueError("environment synchronization is disabled")
+        json.dump(snapshot_environment(cfg), sys.stdout, sort_keys=True)
+        return 0
+    if args.cmd == "environment-plan":
+        from .environmentops import plan_snapshots, snapshot_environment
+        if not cfg.environment.enabled:
+            raise ValueError("environment synchronization is disabled")
+        limit = max(cfg.environment.max_lock_file_bytes * 4, 1024 * 1024)
+        raw = sys.stdin.buffer.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError("environment snapshot exceeds configured limit")
+        source = json.loads(raw.decode("utf-8"))
+        print(json.dumps(
+            plan_snapshots(cfg, source, snapshot_environment(cfg)),
+            sort_keys=True,
+        ))
+        return 0
+    if args.cmd == "environment-apply":
+        from .environmentops import apply_environment_snapshot
+        limit = max(cfg.environment.max_lock_file_bytes * 4, 1024 * 1024)
+        raw = sys.stdin.buffer.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError("environment snapshot exceeds configured limit")
+        snapshot = json.loads(raw.decode("utf-8"))
+        print(json.dumps(
+            apply_environment_snapshot(
+                cfg, args.peer, snapshot, force=args.force
+            ),
+            sort_keys=True,
+        ))
         return 0
     return 1
 
@@ -645,6 +707,80 @@ def run_preferences_command(cfg: Config, args) -> int:
     return 1
 
 
+def run_environment_command(cfg: Config, args) -> int:
+    from .environmentops import (
+        apply_with_peer,
+        list_pending,
+        plan_with_peer,
+        snapshot_environment,
+    )
+
+    if args.environment_cmd == "list":
+        snapshot = snapshot_environment(cfg)
+        if args.json:
+            json.dump(snapshot, sys.stdout, sort_keys=True, indent=2)
+            sys.stdout.write("\n")
+        else:
+            brew = snapshot.get("brew", {})
+            print(
+                "Homebrew: %d formulae, %d casks, %d taps"
+                % (
+                    len(brew.get("formulae", [])),
+                    len(brew.get("casks", [])),
+                    len(brew.get("taps", [])),
+                )
+            )
+            python = snapshot.get("python", {})
+            print("Python: %s" % (python.get("version") or "unavailable"))
+            print(
+                "Tools: %d pip, %d pipx, %d uv"
+                % (
+                    len(snapshot.get("pip", [])),
+                    len(snapshot.get("pipx", [])),
+                    len(snapshot.get("uv", [])),
+                )
+            )
+            print("Restorable venvs: %d" % sum(
+                1
+                for item in snapshot.get("venvs", {}).values()
+                if item.get("restorable")
+            ))
+            for blocked in snapshot.get("blocked", []):
+                print(
+                    "BLOCKED %-40s %s"
+                    % (
+                        blocked.get("source", ""),
+                        blocked.get("reason", ""),
+                    )
+                )
+        return 0
+    if args.environment_cmd == "plan":
+        comparison = plan_with_peer(cfg, args.peer)
+        print(json.dumps(
+            {
+                "pull": comparison["pull"],
+                "push": comparison["push"],
+            },
+            sort_keys=True,
+            indent=2,
+        ))
+        return 0
+    if args.environment_cmd == "apply":
+        print(json.dumps(
+            apply_with_peer(
+                cfg, args.peer, args.direction
+            ),
+            sort_keys=True,
+            indent=2,
+        ))
+        return 0
+    if args.environment_cmd == "pending":
+        for path in list_pending(cfg):
+            print(path)
+        return 0
+    return 1
+
+
 def doctor(cfg: Config) -> int:
     from .util import remote_chatmesh_args, remote_home, ssh_out
     from .config import REMOTE_REPO
@@ -704,6 +840,38 @@ def doctor(cfg: Config) -> int:
         except Exception as exc:
             ok = False
             print("!! preference inventory failed: %s" % exc)
+    if cfg.environment.enabled:
+        from .environmentops import snapshot_environment
+        try:
+            environment_snapshot = snapshot_environment(cfg)
+            print(
+                "environment: %d brew, %d tools, %d venvs, %d blocked"
+                % (
+                    len(environment_snapshot["brew"].get("formulae", []))
+                    + len(environment_snapshot["brew"].get("casks", [])),
+                    len(environment_snapshot.get("pip", []))
+                    + len(environment_snapshot.get("pipx", []))
+                    + len(environment_snapshot.get("uv", [])),
+                    len(environment_snapshot.get("venvs", {})),
+                    len(environment_snapshot.get("blocked", [])),
+                )
+            )
+            incomplete = sorted(
+                key
+                for key, complete in environment_snapshot.get(
+                    "complete", {}
+                ).items()
+                if not complete
+            )
+            if incomplete:
+                ok = False
+                print(
+                    "!! environment inventory incomplete: %s"
+                    % ", ".join(incomplete)
+                )
+        except Exception as exc:
+            ok = False
+            print("!! environment inventory failed: %s" % exc)
     if not cfg.peers:
         print("!! no peers configured — run: chatmesh init")
         return 1
@@ -717,6 +885,11 @@ def doctor(cfg: Config) -> int:
                 '"import chatmesh,sys;sys.stdout.write(chatmesh.VERSION)" '
                 '2>/dev/null || echo none' % REMOTE_REPO).strip()
             print("  chatmesh on peer: %s" % rv)
+            if rv != VERSION:
+                ok = False
+                print(
+                    "  !! peer version mismatch: need %s" % VERSION
+                )
             validation = ssh_out(
                 peer, remote_chatmesh_args(["config", "validate"])
             ).strip()
@@ -761,6 +934,37 @@ def doctor(cfg: Config) -> int:
                     len(remote_preferences["manifest"]["entries"]),
                     len(remote_preferences["manifest"]["blocked"]),
                 ))
+            if cfg.environment.enabled:
+                remote_environment = json.loads(ssh_out(
+                    peer, remote_chatmesh_args(["environment-export"]),
+                    timeout=900,
+                ))
+                print(
+                    "  peer environment: %d brew, %d tools, %d venvs, "
+                    "%d blocked"
+                    % (
+                        len(remote_environment["brew"].get("formulae", []))
+                        + len(remote_environment["brew"].get("casks", [])),
+                        len(remote_environment.get("pip", []))
+                        + len(remote_environment.get("pipx", []))
+                        + len(remote_environment.get("uv", [])),
+                        len(remote_environment.get("venvs", {})),
+                        len(remote_environment.get("blocked", [])),
+                    )
+                )
+                remote_incomplete = sorted(
+                    key
+                    for key, complete in remote_environment.get(
+                        "complete", {}
+                    ).items()
+                    if not complete
+                )
+                if remote_incomplete:
+                    ok = False
+                    print(
+                        "  !! peer environment inventory incomplete: %s"
+                        % ", ".join(remote_incomplete)
+                    )
         except Exception as e:
             ok = False
             print("peer %s: ERROR %s" % (peer, e))

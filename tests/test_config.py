@@ -14,6 +14,7 @@ from chatmesh.config import (
     Config,
     ConfigError,
     CustomPreferencePath,
+    EnvironmentProfile,
     GitProfile,
     MeshConfig,
     PreferencesProfile,
@@ -52,6 +53,8 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertFalse(cfg.preferences.cursor)
         self.assertFalse(cfg.preferences.claude)
         self.assertFalse(cfg.preferences.codex)
+        self.assertFalse(cfg.environment.enabled)
+        self.assertFalse(cfg.environment.auto_apply)
 
     def test_config_path_is_toml_and_fixture_home_is_resolved_at_load_time(self):
         self.assertTrue(CONFIG_PATH.endswith(".config/chatmesh/config.toml"))
@@ -89,6 +92,7 @@ class ConfigDefaultsTests(unittest.TestCase):
             RepositoryOverride,
             PreferencesProfile,
             CustomPreferencePath,
+            EnvironmentProfile,
         ):
             self.assertTrue(is_dataclass(value))
         self.assertIs(Config, MeshConfig)
@@ -301,6 +305,57 @@ class ConfigValidationTests(unittest.TestCase):
             },
             "names must be unique",
         )
+
+    def test_environment_profile_is_typed_bounded_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.dict(
+                os.environ, {"CHATMESH_HOME": temp}, clear=False
+            ):
+                cfg = Config.from_dict({
+                    "environment": {
+                        "enabled": True,
+                        "homebrew": False,
+                        "brewfile": "~/Config/Brewfile",
+                        "python": True,
+                        "pip": False,
+                        "pipx": True,
+                        "uv": True,
+                        "venvs": True,
+                        "auto_apply": False,
+                        "roots": ["~/Code"],
+                        "exclude": ["brew:docker"],
+                        "max_lock_file_bytes": 1234,
+                        "conflict_policy": "manual",
+                    }
+                })
+                reparsed = Config.from_dict(
+                    tomlutil.loads(cfg.to_toml(), force_fallback=True)
+                )
+        self.assertTrue(cfg.environment.enabled)
+        self.assertFalse(cfg.environment.homebrew)
+        self.assertEqual(cfg.environment.roots, [os.path.join(temp, "Code")])
+        self.assertEqual(cfg.environment.max_lock_file_bytes, 1234)
+        self.assertEqual(reparsed, cfg)
+        for document, message in (
+            ({"environment": {"typo": True}}, "unknown key"),
+            ({"environment": {"pip": "yes"}}, "boolean"),
+            (
+                {"environment": {"max_lock_file_bytes": -1}},
+                "at least 0",
+            ),
+            (
+                {
+                    "environment": {
+                        "enabled": True,
+                        "venvs": True,
+                        "roots": [],
+                    }
+                },
+                "must not be empty",
+            ),
+        ):
+            with self.subTest(document=document):
+                self.assert_invalid(document, message)
 
 
 class TomlCompatibilityTests(unittest.TestCase):

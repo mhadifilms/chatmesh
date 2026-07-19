@@ -985,6 +985,150 @@ def sync_preferences(cfg: Config, peer: str, state: dict,
 
 
 # --------------------------------------------------------------------------- #
+# Additive machine environments
+# --------------------------------------------------------------------------- #
+def _remote_plan_environment(peer: str, snapshot: dict) -> dict:
+    proc = subprocess.run(
+        ssh_argv(peer, remote_chatmesh_args(["environment-plan"])),
+        input=json.dumps(snapshot, sort_keys=True).encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=900,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "remote environment plan failed: %s"
+            % proc.stderr.decode("utf-8", "replace").strip()[:1000]
+        )
+    parsed = _last_json(proc.stdout)
+    if parsed is None:
+        raise RuntimeError("remote environment plan returned no result")
+    return parsed
+
+
+def _remote_apply_environment(
+    peer: str,
+    snapshot: dict,
+    *,
+    force: bool = False,
+    action_count: Optional[int] = None,
+) -> dict:
+    if action_count is None:
+        remote_plan = _remote_plan_environment(peer, snapshot)
+        action_count = len(remote_plan.get("actions", []))
+    args = [
+        "environment-apply",
+        "--peer",
+        os.uname().nodename,
+    ] + (["--force"] if force else [])
+    proc = subprocess.run(
+        ssh_argv(peer, remote_chatmesh_args(args)),
+        input=json.dumps(snapshot, sort_keys=True).encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=max(3600, 1800 * (action_count + 1)),
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "remote environment apply failed: %s"
+            % proc.stderr.decode("utf-8", "replace").strip()[:1000]
+        )
+    parsed = _last_json(proc.stdout)
+    if parsed is None:
+        raise RuntimeError("remote environment apply returned no result")
+    return parsed
+
+
+def sync_environment(
+    cfg: Config, peer: str, state: dict, dry_run: bool
+) -> None:
+    from .environmentops import (
+        apply_environment_snapshot,
+        plan_snapshots,
+        snapshot_environment,
+    )
+
+    try:
+        local = snapshot_environment(cfg)
+        remote = _remote_json(peer, ["environment-export"], timeout=900)
+        empty_plan = {
+            "actions": [],
+            "conflicts": [],
+            "blocked": [],
+            "counts": {
+                "install": 0,
+                "keep": 0,
+                "conflict": 0,
+                "blocked": 0,
+            },
+        }
+        pull_plan = (
+            plan_snapshots(cfg, remote, local)
+            if "pull" in cfg.directions
+            else empty_plan
+        )
+        push_plan = (
+            _remote_plan_environment(peer, local)
+            if "push" in cfg.directions
+            else empty_plan
+        )
+        log.info(
+            "environment[%s]: pull=%s push=%s blocked(local=%d remote=%d)",
+            peer,
+            pull_plan["counts"],
+            push_plan["counts"],
+            len(local.get("blocked", [])),
+            len(remote.get("blocked", [])),
+        )
+        if dry_run:
+            mark(
+                state,
+                peer,
+                "environment",
+                "sync",
+                ok=True,
+                dry_run=True,
+                pull=pull_plan["counts"],
+                push=push_plan["counts"],
+            )
+            return
+        local_result = {
+            "ok": True,
+            "applied": [],
+            "failed": [],
+            "pending": 0,
+            "conflicts": [],
+        }
+        remote_result = dict(local_result)
+        if "pull" in cfg.directions:
+            local_result = apply_environment_snapshot(cfg, peer, remote)
+        if "push" in cfg.directions:
+            remote_result = _remote_apply_environment(
+                peer,
+                local,
+                action_count=len(push_plan.get("actions", [])),
+            )
+        mark(
+            state,
+            peer,
+            "environment",
+            "sync",
+            ok=bool(local_result.get("ok") and remote_result.get("ok")),
+            local_applied=len(local_result.get("applied", [])),
+            local_failed=len(local_result.get("failed", [])),
+            local_pending=int(local_result.get("pending", 0)),
+            local_conflicts=len(local_result.get("conflicts", [])),
+            remote_applied=len(remote_result.get("applied", [])),
+            remote_failed=len(remote_result.get("failed", [])),
+            remote_pending=int(remote_result.get("pending", 0)),
+            remote_conflicts=len(remote_result.get("conflicts", [])),
+        )
+    except Exception as exc:
+        log.error("environment[%s]: %s", peer, exc)
+        mark(state, peer, "environment", "sync", ok=False, error=str(exc))
+
+
+# --------------------------------------------------------------------------- #
 # Entry
 # --------------------------------------------------------------------------- #
 APP_UNITS = {
@@ -1049,6 +1193,14 @@ def sync_all(cfg: Config, only_peer: Optional[str] = None,
                 sync_preferences(cfg, peer, state, dry_run)
             except Exception as e:
                 log.exception("preferences[%s] failed: %s", peer, e)
+        if (
+            cfg.environment.enabled
+            and (only_app is None or only_app == "environment")
+        ):
+            try:
+                sync_environment(cfg, peer, state, dry_run)
+            except Exception as e:
+                log.exception("environment[%s] failed: %s", peer, e)
         if not dry_run:
             save_state(state, cfg.state_dir)
     log.info("sync complete")

@@ -192,6 +192,25 @@ class PreferencesProfile:
 
 
 @dataclass
+class EnvironmentProfile:
+    """Additive-only package, runtime, tool, and venv synchronization."""
+
+    enabled: bool = False
+    homebrew: bool = True
+    brewfile: str = field(default_factory=lambda: os.path.join(home_dir(), "Brewfile"))
+    python: bool = True
+    pip: bool = True
+    pipx: bool = True
+    uv: bool = True
+    venvs: bool = True
+    auto_apply: bool = False
+    roots: List[str] = field(default_factory=lambda: [_default_github_root()])
+    exclude: List[str] = field(default_factory=list)
+    max_lock_file_bytes: int = 10 * 1024 * 1024
+    conflict_policy: str = "quarantine"
+
+
+@dataclass
 class MeshConfig:
     """Complete validated Chatmesh configuration."""
 
@@ -211,6 +230,7 @@ class MeshConfig:
     state_dir: str = field(default_factory=default_state_dir)
     git: GitProfile = field(default_factory=GitProfile)
     preferences: PreferencesProfile = field(default_factory=PreferencesProfile)
+    environment: EnvironmentProfile = field(default_factory=EnvironmentProfile)
 
     @property
     def git_profile(self) -> GitProfile:
@@ -219,6 +239,10 @@ class MeshConfig:
     @property
     def preferences_profile(self) -> PreferencesProfile:
         return self.preferences
+
+    @property
+    def environment_profile(self) -> EnvironmentProfile:
+        return self.environment
 
     @classmethod
     def load(cls, path: Optional[str] = None) -> "MeshConfig":
@@ -236,7 +260,11 @@ class MeshConfig:
     def from_dict(cls, document: Mapping[str, Any]) -> "MeshConfig":
         if not isinstance(document, Mapping):
             raise ConfigError("configuration must be a TOML table")
-        _reject_unknown(document, {"version", "mesh", "git", "preferences"}, "root")
+        _reject_unknown(
+            document,
+            {"version", "mesh", "git", "preferences", "environment"},
+            "root",
+        )
         version = document.get("version", 1)
         _require_int(version, "version", minimum=1)
         if version != 1:
@@ -247,6 +275,9 @@ class MeshConfig:
         git_data = _mapping(document.get("git", {}), "git")
         preferences_data = _mapping(
             document.get("preferences", {}), "preferences"
+        )
+        environment_data = _mapping(
+            document.get("environment", {}), "environment"
         )
         return cls(
             peers=_string_list(mesh.get("peers", []), "mesh.peers"),
@@ -282,6 +313,7 @@ class MeshConfig:
             ),
             git=_parse_git_profile(git_data),
             preferences=_parse_preferences_profile(preferences_data),
+            environment=_parse_environment_profile(environment_data),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -339,11 +371,29 @@ class MeshConfig:
                 for item in self.preferences.custom_paths
             ],
         }
+        environment: Dict[str, Any] = {
+            "enabled": self.environment.enabled,
+            "homebrew": self.environment.homebrew,
+            "brewfile": _portable_path(self.environment.brewfile),
+            "python": self.environment.python,
+            "pip": self.environment.pip,
+            "pipx": self.environment.pipx,
+            "uv": self.environment.uv,
+            "venvs": self.environment.venvs,
+            "auto_apply": self.environment.auto_apply,
+            "roots": [
+                _portable_path(path) for path in self.environment.roots
+            ],
+            "exclude": list(self.environment.exclude),
+            "max_lock_file_bytes": self.environment.max_lock_file_bytes,
+            "conflict_policy": self.environment.conflict_policy,
+        }
         return {
             "version": 1,
             "mesh": mesh,
             "git": git,
             "preferences": preferences,
+            "environment": environment,
         }
 
     def to_toml(self) -> str:
@@ -392,7 +442,7 @@ def example_toml() -> str:
     header = (
         "# Chatmesh configuration.\n"
         "# Peers are SSH host aliases from ~/.ssh/config.\n"
-        "# Git and preference synchronization are opt-in.\n\n"
+        "# Git, preference, and environment synchronization are opt-in.\n\n"
     )
     return header + MeshConfig().to_toml()
 
@@ -761,6 +811,73 @@ def _parse_preferences_profile(
             data.get("exclude", []), "preferences.exclude"
         ),
         custom_paths=custom,
+    )
+
+
+def _parse_environment_profile(
+    data: Mapping[str, Any],
+) -> EnvironmentProfile:
+    allowed = {
+        "enabled",
+        "homebrew",
+        "brewfile",
+        "python",
+        "pip",
+        "pipx",
+        "uv",
+        "venvs",
+        "auto_apply",
+        "roots",
+        "exclude",
+        "max_lock_file_bytes",
+        "conflict_policy",
+    }
+    _reject_unknown(data, allowed, "environment")
+    roots_text = _string_list(
+        data.get("roots", ["~/Documents/GitHub"]), "environment.roots"
+    )
+    roots = [
+        _absolute_path(root, "environment.roots[%d]" % index)
+        for index, root in enumerate(roots_text)
+    ]
+    if len(roots) != len(set(roots)):
+        raise ConfigError("environment.roots resolve to duplicate paths")
+    enabled = _boolean(
+        data.get("enabled", False), "environment.enabled"
+    )
+    venvs = _boolean(data.get("venvs", True), "environment.venvs")
+    if enabled and venvs and not roots:
+        raise ConfigError(
+            "environment.roots must not be empty when venv sync is enabled"
+        )
+    return EnvironmentProfile(
+        enabled=enabled,
+        homebrew=_boolean(
+            data.get("homebrew", True), "environment.homebrew"
+        ),
+        brewfile=_absolute_path(
+            data.get("brewfile", "~/Brewfile"), "environment.brewfile"
+        ),
+        python=_boolean(data.get("python", True), "environment.python"),
+        pip=_boolean(data.get("pip", True), "environment.pip"),
+        pipx=_boolean(data.get("pipx", True), "environment.pipx"),
+        uv=_boolean(data.get("uv", True), "environment.uv"),
+        venvs=venvs,
+        auto_apply=_boolean(
+            data.get("auto_apply", False), "environment.auto_apply"
+        ),
+        roots=roots,
+        exclude=_string_list(
+            data.get("exclude", []), "environment.exclude"
+        ),
+        max_lock_file_bytes=_integer(
+            data.get("max_lock_file_bytes", 10 * 1024 * 1024),
+            "environment.max_lock_file_bytes",
+        ),
+        conflict_policy=_conflict_policy(
+            data.get("conflict_policy", "quarantine"),
+            "environment.conflict_policy",
+        ),
     )
 
 

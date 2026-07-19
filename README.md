@@ -1,9 +1,9 @@
 # chatmesh
 
 Chatmesh synchronizes agent chats, Git repositories and exact work-in-progress,
-and curated AI-tool preferences between Macs with different home paths. The
-machine running `chatmesh sync` is the hub and drives both SSH directions; a
-peer never needs SSH access back to the hub.
+curated AI-tool preferences, and declarative machine environments between Macs
+with different home paths. The machine running `chatmesh sync` is the hub and
+drives both SSH directions; a peer never needs SSH access back to the hub.
 
 ## What syncs
 
@@ -18,6 +18,9 @@ peer never needs SSH access back to the hub.
   and configured WIP categories are synchronized with Git plumbing.
 - Curated Cursor, Claude, Codex, and custom user preference paths use hash-based
   three-way merge rather than mtime.
+- Homebrew declarations, user-level pip packages, pipx/uv tools, Python runtime
+  compatibility, and restorable project venv declarations can be inventoried
+  and synchronized additively.
 
 Project `.cursor`, `.claude`, `.codex`, `.agents`, `AGENTS.md`, and
 `CLAUDE.md` files belong to the Git WIP snapshot. Preference adapters only own
@@ -49,6 +52,12 @@ user-level paths.
   references.
 - Cursor's narrowly allow-listed global user-rule value is read or written only
   while Cursor is closed; no whole settings row is copied.
+- Environment sync never copies Homebrew prefixes, Python interpreters,
+  `site-packages`, or venv directories. It never uninstalls, force-upgrades, or
+  downgrades packages. Existing venvs are never replaced; a missing venv may be
+  created only from an unchanged flat, fully pinned requirements file. `uv`
+  tool installations sync additively; project `uv.lock` recreation remains
+  manual because local/workspace dependency closure cannot be proven safely.
 
 ## Configuration
 
@@ -108,6 +117,21 @@ path = "~/.future-tool/preferences"
 kind = "tree"
 rewrite_home = true
 exclude = ["cache/**"]
+
+[environment]
+enabled = false
+homebrew = true
+brewfile = "~/Brewfile"
+python = true
+pip = true
+pipx = true
+uv = true
+venvs = true
+auto_apply = false
+roots = ["~/Documents/GitHub"]
+exclude = []
+max_lock_file_bytes = 10485760
+conflict_policy = "quarantine"
 ```
 
 Repository overrides are matched by the stable identity shown by
@@ -135,7 +159,8 @@ bin/chatmesh config migrate --from ~/.config/chatmesh/env
 ```
 
 A dry run does not deploy code, update sync state, cache GitHub resolution, or
-write repositories/preferences. Deploy the same version first.
+write repositories, preferences, packages, tools, or venvs. Deploy the same
+version first.
 
 ## Operations
 
@@ -150,6 +175,11 @@ bin/chatmesh git accept --repo /path/to/repo --branch dev \
 bin/chatmesh git recover --repo /path/to/repo --journal /path/to/journal.json
 bin/chatmesh preferences list
 bin/chatmesh preferences conflicts
+bin/chatmesh environment list
+bin/chatmesh environment plan --peer mhadi-mini
+bin/chatmesh sync --app environment --peer mhadi-mini --dry-run
+bin/chatmesh environment apply --peer mhadi-mini --direction pull
+bin/chatmesh environment pending
 ```
 
 Logs, backups, inboxes, baselines, and conflict records live below
