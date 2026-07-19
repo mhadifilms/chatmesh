@@ -5,11 +5,12 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
+import shlex
 import subprocess
 import sys
 from typing import List, Optional
 
-from .config import STATE_DIR, REMOTE_REPO
+from .config import REMOTE_REPO, default_state_dir
 
 log = logging.getLogger("chatmesh")
 
@@ -21,24 +22,29 @@ def home() -> str:
     return os.environ.get("CHATMESH_HOME") or os.path.expanduser("~")
 
 
-def setup_logging(level: str = "INFO") -> None:
-    os.makedirs(os.path.join(STATE_DIR, "logs"), exist_ok=True)
+def setup_logging(level: str = "INFO", state_dir: Optional[str] = None,
+                  file_logging: bool = True) -> None:
+    state_dir = state_dir or default_state_dir()
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    fh = logging.FileHandler(os.path.join(STATE_DIR, "logs", "chatmesh.log"))
-    fh.setFormatter(fmt)
     sh = logging.StreamHandler(sys.stderr)
     sh.setFormatter(fmt)
     log.setLevel(getattr(logging, level, logging.INFO))
-    log.addHandler(fh)
-    log.addHandler(sh)
+    if not log.handlers:
+        if file_logging:
+            os.makedirs(os.path.join(state_dir, "logs"), exist_ok=True)
+            fh = logging.FileHandler(os.path.join(state_dir, "logs", "chatmesh.log"))
+            fh.setFormatter(fmt)
+            log.addHandler(fh)
+        log.addHandler(sh)
 
 
 class Lock:
     """Exclusive advisory lock so overlapping launchd runs no-op."""
 
-    def __init__(self, name: str = "sync.lock"):
-        os.makedirs(STATE_DIR, exist_ok=True)
-        self.path = os.path.join(STATE_DIR, name)
+    def __init__(self, name: str = "sync.lock", state_dir: Optional[str] = None):
+        state_dir = state_dir or default_state_dir()
+        os.makedirs(state_dir, exist_ok=True)
+        self.path = os.path.join(state_dir, name)
         self.fd: Optional[int] = None
 
     def acquire(self) -> bool:
@@ -84,6 +90,13 @@ def remote_home(peer: str) -> str:
 def remote_chatmesh_cmd(sub: str) -> str:
     """Shell command string that runs a chatmesh subcommand on a peer."""
     return 'PYTHONPATH="$HOME/%s" python3 -m chatmesh %s' % (REMOTE_REPO, sub)
+
+
+def remote_chatmesh_args(args: List[str]) -> str:
+    """Safely quote an argv list for a remote Chatmesh invocation."""
+    return 'PYTHONPATH="$HOME/%s" python3 -m chatmesh %s' % (
+        REMOTE_REPO, " ".join(shlex.quote(str(arg)) for arg in args),
+    )
 
 
 # --------------------------------------------------------------------------- #

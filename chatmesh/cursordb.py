@@ -8,7 +8,7 @@ Model (verified against Cursor 2.x):
     codeBlockDiff:<cid>:<id>, codeBlockPartialInlineDiffFates:<cid>:<id>,
     ofsContent:<cid>:file://<path>   (path inside the KEY — keys get rewritten).
   * Checkpoint/restore state (checkpointId:*, agentKv:*) is a content-addressed
-    store measured in tens of GB; excluded unless CHATMESH_SYNC_CHECKPOINTS=1
+    store measured in tens of GB; excluded unless mesh.sync_checkpoints=true
     (v0.1 excludes the agentKv blob CAS entirely).
   * Cursor matches workspaceStorage dirs to folders by the URI in
     workspace.json (it does not re-hash paths), so foreign workspace ids work
@@ -28,7 +28,7 @@ import json
 import os
 import sqlite3
 import sys
-from typing import Dict, List, Optional, TextIO, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .rewrite import HomeRewriter
 from .util import app_running_local, log

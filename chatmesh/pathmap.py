@@ -78,7 +78,6 @@ class PathMap:
     def _compile(pairs, boundary, as_bytes):
         if not pairs:
             return None
-        alt = "|".join(re.escape(o) for o, _ in pairs) + boundary
         pat = "(" + "|".join(re.escape(o) for o, _ in pairs) + ")" + boundary
         return re.compile(pat.encode() if as_bytes else pat)
 

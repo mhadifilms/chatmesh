@@ -1,4 +1,3 @@
-"""chatmesh — multi-way sync of agentic chat history (Cursor, Claude Code,
-Codex) between Macs, with per-machine username/path rewriting."""
+"""Non-destructive Git, WIP, and agent-state synchronization between Macs."""
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"

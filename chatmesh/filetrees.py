@@ -25,7 +25,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import re
+import stat
 import sqlite3
 import sys
 import tarfile
@@ -33,9 +35,9 @@ import tempfile
 import time
 from typing import Dict, List, Optional, Tuple
 
-from .config import STATE_DIR
+from .config import default_state_dir
 from .rewrite import HomeRewriter
-from .util import home as _home, log
+from .util import home as _home
 
 TREES = {
     "claude-projects": {"root": "~/.claude/projects", "rewrite": True, "rename": "claude"},
@@ -49,9 +51,12 @@ HISTORY_FILES = {
 SKIP_SUFFIXES = ("-wal", "-shm", "-journal")
 SKIP_NAMES = {".DS_Store"}
 MTIME_SLOP = 2  # seconds; filesystems differ in mtime precision
+MAX_ARCHIVE_MEMBER_BYTES = 1024 * 1024 * 1024
 
 _CWD_RE = re.compile(rb'Workspace Path: ([^\\"\n]+)')
-_CWD_CACHE_PATH = os.path.join(STATE_DIR, "cwdcache.json")
+
+def _cwd_cache_path() -> str:
+    return os.path.join(default_state_dir(), "cwdcache.json")
 
 
 def tree_root(tree: str, home: Optional[str] = None) -> str:
@@ -59,25 +64,92 @@ def tree_root(tree: str, home: Optional[str] = None) -> str:
     return rel
 
 
+def safe_relpath(rel: str) -> str:
+    """Return a normalized archive relpath or raise on an unsafe path."""
+    if not isinstance(rel, str) or not rel or "\x00" in rel or "\\" in rel:
+        raise ValueError("invalid relative path")
+    if rel.startswith("/") or posixpath.normpath(rel) != rel:
+        raise ValueError("unsafe relative path: %r" % rel)
+    parts = rel.split("/")
+    if any(p in ("", ".", "..", ".git") for p in parts):
+        raise ValueError("unsafe relative path: %r" % rel)
+    return rel
+
+
+def safe_path(root: str, rel: str, allow_final_symlink: bool = False) -> str:
+    """Join *rel* beneath *root*, rejecting symlink escapes."""
+    rel = safe_relpath(rel)
+    base = os.path.realpath(root)
+    cur = root
+    parts = rel.split("/")
+    for index, part in enumerate(parts):
+        cur = os.path.join(cur, part)
+        is_final = index == len(parts) - 1
+        if os.path.lexists(cur) and os.path.islink(cur):
+            if is_final and allow_final_symlink:
+                continue
+            resolved = os.path.realpath(cur)
+            try:
+                inside = os.path.commonpath([base, resolved]) == base
+            except ValueError:
+                inside = False
+            if not inside:
+                raise ValueError("symlink escapes tree: %s" % rel)
+    parent = os.path.realpath(os.path.dirname(cur))
+    try:
+        inside = os.path.commonpath([base, parent]) == base
+    except ValueError:
+        inside = False
+    if not inside:
+        raise ValueError("path escapes tree: %s" % rel)
+    return cur
+
+
+def _safe_link_target(root: str, rel: str, target: str) -> None:
+    if not target or "\x00" in target or os.path.isabs(target):
+        raise ValueError("unsafe symlink target")
+    resolved = os.path.realpath(os.path.join(root, os.path.dirname(rel), target))
+    base = os.path.realpath(root)
+    try:
+        inside = os.path.commonpath([base, resolved]) == base
+    except ValueError:
+        inside = False
+    if not inside:
+        raise ValueError("symlink target escapes tree")
+
+
+def _backup_existing(src: str, dst: str) -> None:
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.lexists(dst):
+        return
+    if os.path.islink(src):
+        os.symlink(os.readlink(src), dst)
+    elif os.path.isfile(src):
+        with open(src, "rb") as a, open(dst, "wb") as b:
+            b.write(a.read())
+        os.chmod(dst, stat.S_IMODE(os.lstat(src).st_mode))
+
+
 # --------------------------------------------------------------------------- #
 # cursor-cli cwd extraction (md5 dir remap)
 # --------------------------------------------------------------------------- #
 def _load_cwd_cache() -> dict:
     try:
-        with open(_CWD_CACHE_PATH) as f:
+        with open(_cwd_cache_path()) as f:
             return json.load(f)
     except Exception:
         return {}
 
 
 def _save_cwd_cache(cache: dict) -> None:
-    os.makedirs(STATE_DIR, exist_ok=True)
+    path = _cwd_cache_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     if len(cache) > 5000:
         cache = dict(list(cache.items())[-4000:])
-    tmp = _CWD_CACHE_PATH + ".tmp"
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(cache, f)
-    os.replace(tmp, _CWD_CACHE_PATH)
+    os.replace(tmp, path)
 
 
 def extract_cwd(store_db: str) -> Optional[str]:
@@ -132,15 +204,23 @@ def manifest(tree: str) -> dict:
     root = tree_root(tree)
     files: Dict[str, List[float]] = {}
     if os.path.isdir(root):
-        for dirpath, _dirnames, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [d for d in dirnames
+                           if d not in SKIP_NAMES and d != ".git"
+                           and not os.path.islink(os.path.join(dirpath, d))]
             for fn in filenames:
                 if fn in SKIP_NAMES or fn.endswith(SKIP_SUFFIXES):
                     continue
                 p = os.path.join(dirpath, fn)
-                rel = os.path.relpath(p, root)
+                rel = os.path.relpath(p, root).replace(os.sep, "/")
                 try:
-                    st = os.stat(p)
-                except OSError:
+                    safe_relpath(rel)
+                    st = os.lstat(p)
+                    if stat.S_ISLNK(st.st_mode):
+                        _safe_link_target(root, rel, os.readlink(p))
+                    elif not stat.S_ISREG(st.st_mode):
+                        continue
+                except (OSError, ValueError):
                     continue
                 files[rel] = [st.st_mtime, st.st_size]
     out = {"v": 1, "tree": tree, "home": _home(), "files": files}
@@ -199,16 +279,28 @@ def plan_transfers(tree: str, src_man: dict, dst_man: dict,
 def cmd_send(tree: str) -> None:
     root = tree_root(tree)
     rels = json.load(sys.stdin)
+    if not isinstance(rels, list):
+        raise ValueError("file list must be an array")
     use_backup = TREES[tree].get("sqlite", False)
     tf = tarfile.open(fileobj=sys.stdout.buffer, mode="w|")
     tmpdir = tempfile.mkdtemp(prefix="chatmesh-send-")
     try:
         for rel in rels:
-            p = os.path.join(root, rel)
-            if not os.path.isfile(p):
+            try:
+                rel = safe_relpath(rel)
+                p = safe_path(root, rel, allow_final_symlink=True)
+                st = os.lstat(p)
+            except (OSError, ValueError):
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                try:
+                    _safe_link_target(root, rel, os.readlink(p))
+                except ValueError:
+                    continue
+            elif not stat.S_ISREG(st.st_mode):
                 continue
             src = p
-            if use_backup and rel.endswith(".db"):
+            if use_backup and rel.endswith(".db") and not stat.S_ISLNK(st.st_mode):
                 snap = os.path.join(tmpdir, hashlib.md5(rel.encode()).hexdigest())
                 try:
                     con = sqlite3.connect(p, timeout=30)
@@ -240,15 +332,37 @@ def cmd_recv(tree: str, src_home: str, backup_dir: str, guard_sec: int) -> None:
     written = skipped = 0
     tf = tarfile.open(fileobj=sys.stdin.buffer, mode="r|")
     tmp_sessions: Dict[str, str] = {}
+    seen = set()
     for member in tf:
-        if not member.isfile():
+        try:
+            rel = safe_relpath(member.name)
+        except ValueError:
+            skipped += 1
             continue
-        f = tf.extractfile(member)
-        if f is None:
+        if rel in seen or member.islnk() or member.isdir():
+            skipped += 1
             continue
-        data = f.read()
-        rel = member.name
+        seen.add(rel)
+        if not member.isfile() and not member.issym():
+            skipped += 1
+            continue
+        if member.size > MAX_ARCHIVE_MEMBER_BYTES:
+            skipped += 1
+            continue
+        data = b""
+        if member.isfile():
+            f = tf.extractfile(member)
+            if f is None:
+                skipped += 1
+                continue
+            data = f.read(MAX_ARCHIVE_MEMBER_BYTES + 1)
+            if len(data) > MAX_ARCHIVE_MEMBER_BYTES:
+                skipped += 1
+                continue
         if is_md5:
+            if member.issym():
+                skipped += 1
+                continue
             # need the cwd from this store.db to compute the local hash dir
             hashdir = rel.split("/", 1)[0]
             if hashdir not in tmp_sessions:
@@ -267,6 +381,11 @@ def cmd_recv(tree: str, src_home: str, backup_dir: str, guard_sec: int) -> None:
             drel = "/".join(parts)
         else:
             drel = normalize_rel(tree, rel, rw, {})
+        try:
+            drel = safe_relpath(drel)
+        except ValueError:
+            skipped += 1
+            continue
         if do_rewrite:
             try:
                 text = data.decode("utf-8")
@@ -275,22 +394,36 @@ def cmd_recv(tree: str, src_home: str, backup_dir: str, guard_sec: int) -> None:
                     data = ntext.encode("utf-8")
             except UnicodeDecodeError:
                 pass
-        dst = os.path.join(root, drel)
-        if os.path.exists(dst):
-            st = os.stat(dst)
+        try:
+            dst = safe_path(root, drel, allow_final_symlink=True)
+            if member.issym():
+                _safe_link_target(root, drel, member.linkname)
+        except ValueError:
+            skipped += 1
+            continue
+        if os.path.lexists(dst):
+            st = os.lstat(dst)
             if member.mtime <= st.st_mtime + MTIME_SLOP or now - st.st_mtime < guard_sec:
                 skipped += 1
                 continue
             bpath = os.path.join(backup_dir, tree, drel)
-            os.makedirs(os.path.dirname(bpath), exist_ok=True)
-            with open(dst, "rb") as a, open(bpath, "wb") as b:
-                b.write(a.read())
+            _backup_existing(dst, bpath)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         tmp = dst + ".chatmesh-tmp"
-        with open(tmp, "wb") as out:
-            out.write(data)
-        os.utime(tmp, (member.mtime, member.mtime))
-        os.replace(tmp, dst)
+        try:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+            if member.issym():
+                os.symlink(member.linkname, tmp)
+            else:
+                with open(tmp, "wb") as out:
+                    out.write(data)
+                os.chmod(tmp, member.mode & 0o777)
+                os.utime(tmp, (member.mtime, member.mtime))
+            os.replace(tmp, dst)
+        finally:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
         written += 1
     tf.close()
     print(json.dumps({"ok": True, "written": written, "skipped": skipped}))

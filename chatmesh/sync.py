@@ -10,7 +10,7 @@ Gating (the "don't sync while the app is open" rule):
   * claude / codex: per-file guard only — any session file touched within the
     guard window (default 15 min) on either side is left alone. A process gate
     would permanently block machines where a CLI session is always open.
-    Add them to CHATMESH_PROCESS_GATE_APPS for strict behavior.
+    Add them to mesh.process_gate_apps in config.toml for strict behavior.
 """
 
 from __future__ import annotations
@@ -19,35 +19,40 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Optional
 
 from . import VERSION, cursordb, filetrees
-from .config import Config, REMOTE_REPO, STATE_DIR
+from .config import Config, REMOTE_REPO, default_state_dir
 from .rewrite import HomeRewriter
 from .util import (app_running_local, app_running_remote, log, remote_chatmesh_cmd,
-                   remote_home, run, ssh_argv, ssh_out)
+                   remote_chatmesh_args, remote_home, run, ssh_argv, ssh_out)
 
-STATE_PATH = os.path.join(STATE_DIR, "state.json")
 TREE_APP = {"claude-projects": "claude", "codex-sessions": "codex",
             "cursor-cli": "cursor-cli"}
 HISTORY_APP = {"claude-history": "claude", "codex-history": "codex"}
 
 
-def load_state() -> dict:
+def state_path(state_dir: str = "") -> str:
+    return os.path.join(state_dir or default_state_dir(), "state.json")
+
+
+def load_state(state_dir: str = "") -> dict:
     try:
-        with open(STATE_PATH) as f:
+        with open(state_path(state_dir)) as f:
             return json.load(f)
     except Exception:
         return {}
 
 
-def save_state(state: dict) -> None:
-    os.makedirs(STATE_DIR, exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
+def save_state(state: dict, state_dir: str = "") -> None:
+    path = state_path(state_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f, indent=1)
-    os.replace(tmp, STATE_PATH)
+    os.replace(tmp, path)
 
 
 def mark(state: dict, peer: str, unit: str, direction: str, **detail) -> None:
@@ -59,8 +64,9 @@ def repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def backup_dir() -> str:
-    d = os.path.join(STATE_DIR, "backups", time.strftime("%Y%m%d"))
+def backup_dir(state_dir: str = "") -> str:
+    d = os.path.join(state_dir or default_state_dir(), "backups",
+                     time.strftime("%Y%m%d"))
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -68,15 +74,19 @@ def backup_dir() -> str:
 # --------------------------------------------------------------------------- #
 # Peer deployment (chatmesh must exist on the peer for export/apply)
 # --------------------------------------------------------------------------- #
-def ensure_deployed(peer: str, force: bool = False) -> None:
+def deployed_version(peer: str) -> str:
     try:
-        rv = ssh_out(
+        return ssh_out(
             peer,
             'PYTHONPATH="$HOME/%s" python3 -c '
             '"import chatmesh,sys;sys.stdout.write(chatmesh.VERSION)" '
             '2>/dev/null || true' % REMOTE_REPO).strip()
     except RuntimeError:
-        rv = ""
+        return ""
+
+
+def ensure_deployed(peer: str, force: bool = False) -> None:
+    rv = deployed_version(peer)
     if rv == VERSION and not force:
         return
     log.info("deploying chatmesh %s to %s (had: %s)", VERSION, peer, rv or "none")
@@ -130,7 +140,8 @@ def sync_cursor(cfg: Config, peer: str, rhome: str, state: dict,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
             app = subprocess.Popen(
                 [sys.executable, "-m", "chatmesh", "apply-cursor",
-                 "--backup", os.path.join(backup_dir(), "cursor-rows-%s.jsonl" % peer)],
+                 "--backup", os.path.join(backup_dir(cfg.state_dir),
+                                          "cursor-rows-%s.jsonl" % peer)],
                 stdin=exp.stdout, stdout=subprocess.PIPE,
                 env=dict(os.environ, PYTHONPATH=repo_root()))
             _pipe_json(exp, pull)
@@ -204,7 +215,7 @@ def sync_tree(cfg: Config, peer: str, rhome: str, tree: str, state: dict,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
             recv = subprocess.Popen(
                 [sys.executable, "-m", "chatmesh", "files-recv", "--tree", tree,
-                 "--src-home", rhome, "--backup", backup_dir(),
+                 "--src-home", rhome, "--backup", backup_dir(cfg.state_dir),
                  "--guard", str(cfg.file_guard_sec)],
                 stdin=send.stdout, stdout=subprocess.PIPE,
                 env=dict(os.environ, PYTHONPATH=repo_root()))
@@ -285,6 +296,695 @@ def sync_history(cfg: Config, peer: str, rhome: str, name: str, state: dict,
 
 
 # --------------------------------------------------------------------------- #
+# Git repositories, refs, worktrees, and WIP
+# --------------------------------------------------------------------------- #
+def _remote_json(peer: str, args, timeout: int = 600) -> dict:
+    text = ssh_out(peer, remote_chatmesh_args(list(args)), timeout=timeout)
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            return json.loads(line)
+    raise RuntimeError("remote command returned no JSON")
+
+
+def _local_git_manifest(cfg: Config, dry_run: bool = False) -> dict:
+    from .repoops import inventory
+    inventory_errors = []
+    return {
+        "version": 1,
+        "roots": cfg.git.roots,
+        "repositories": inventory(
+            cfg.git,
+            github_cache=(
+                None if dry_run else
+                os.path.join(cfg.state_dir, "github-repositories.json")
+            ),
+            resolve_github=True,
+            errors=inventory_errors,
+        ),
+        "errors": inventory_errors,
+    }
+
+
+def _sync_repo_layout(cfg: Config, peer: str, local_manifest: dict,
+                      remote_manifest: dict, dry_run: bool) -> bool:
+    """Canonicalize origins/paths; return whether manifests need refreshing."""
+    from . import gitrepos
+    from .repoops import (
+        relocation_target,
+        relocate_repository,
+        update_canonical_origin,
+    )
+
+    moved = False
+    cursor_running = {
+        "local": app_running_local("cursor"),
+        "remote": app_running_remote(peer, "cursor"),
+    }
+    for side, records, roots in (
+        ("local", local_manifest["repositories"], cfg.git.roots),
+        ("remote", remote_manifest["repositories"], remote_manifest.get("roots", [])),
+    ):
+        targets = {}
+        for candidate in records:
+            target = relocation_target(candidate, roots)
+            if target:
+                targets.setdefault(os.path.normpath(target), []).append(candidate)
+        for record in records:
+            profile = cfg.git.for_repository(record.get("identity", ""))
+            if not profile.enabled:
+                continue
+            origin = record.get("origin")
+            path = record.get("logical_path")
+            if origin and path:
+                if side == "local":
+                    changed = update_canonical_origin(path, origin, dry_run=dry_run)
+                else:
+                    changed = _remote_json(
+                        peer,
+                        ["git-set-origin", "--repo", path, "--origin", origin]
+                        + (["--dry-run"] if dry_run else []),
+                    ).get("changed", False)
+                if changed:
+                    log.info("git[%s]: canonicalized %s origin for %s",
+                             peer, side, path)
+            if not profile.relocate:
+                continue
+            if (
+                record.get("kind") == "linked-worktree"
+                and cursor_running[side]
+            ):
+                log.info(
+                    "git[%s]: %s worktree relocation gated while Cursor "
+                    "is running: %s",
+                    peer, side, path,
+                )
+                continue
+            target = relocation_target(record, roots)
+            if not target or os.path.normpath(path) == os.path.normpath(target):
+                continue
+            if len(targets.get(os.path.normpath(target), [])) > 1:
+                log.error(
+                    "git[%s]: %s relocation quarantined; multiple checkouts "
+                    "claim %s",
+                    peer, side, target,
+                )
+                continue
+            log.info("git[%s]: %s relocation %s -> %s",
+                     peer, side, path, target)
+            try:
+                if side == "local":
+                    relocate_repository(
+                        gitrepos.open_repository(path), target, dry_run=dry_run
+                    )
+                else:
+                    _remote_json(
+                        peer,
+                        ["git-relocate", "--repo", path, "--target", target]
+                        + (["--dry-run"] if dry_run else []),
+                    )
+                moved = moved or not dry_run
+            except Exception as exc:
+                log.error("git[%s]: %s relocation blocked: %s", peer, side, exc)
+    return moved
+
+
+def _bootstrap_missing_repositories(cfg: Config, peer: str,
+                                    local_manifest: dict,
+                                    remote_manifest: dict,
+                                    local_only, remote_only,
+                                    dry_run: bool) -> bool:
+    from .gittransport import push_all_refs
+    from .repoops import (
+        canonical_main_path,
+        clone_from_peer,
+        update_canonical_origin,
+    )
+
+    changed = False
+    local_identities = {item["identity"] for item in local_manifest["repositories"]}
+    remote_identities = {item["identity"] for item in remote_manifest["repositories"]}
+
+    def destination_claims(records, roots):
+        claims = {}
+        for item in records:
+            item_profile = cfg.git.for_repository(item.get("identity", ""))
+            if not item_profile.enabled or not item_profile.clone_missing:
+                continue
+            if (
+                item.get("nested")
+                or item.get("kind") in ("submodule", "linked-worktree")
+            ):
+                continue
+            target = canonical_main_path(item, roots)
+            if target:
+                claims.setdefault(os.path.normpath(target), []).append(item)
+        return claims
+
+    local_claims = destination_claims(remote_only, cfg.git.roots)
+    remote_claims = destination_claims(
+        local_only, remote_manifest.get("roots", [])
+    )
+
+    for record in remote_only:
+        profile = cfg.git.for_repository(record.get("identity", ""))
+        if not profile.enabled or not profile.clone_missing:
+            continue
+        if record.get("identity") in local_identities:
+            continue
+        if (
+            record.get("nested")
+            or record.get("kind") in ("submodule", "linked-worktree")
+        ):
+            log.info("git[%s]: missing nested/worktree checkout requires parent mapping: %s",
+                     peer, record.get("logical_path"))
+            continue
+        target = canonical_main_path(record, cfg.git.roots)
+        if not target:
+            continue
+        if len(local_claims.get(os.path.normpath(target), [])) > 1:
+            log.error(
+                "git[%s]: local clone quarantined; multiple peer checkouts "
+                "claim %s",
+                peer, target,
+            )
+            continue
+        log.info("git[%s]: clone peer %s -> %s",
+                 peer, record["logical_path"], target)
+        try:
+            clone_from_peer(
+                peer, record["real_path"], target,
+                branch=record.get("branch"), dry_run=dry_run,
+            )
+            if not dry_run and record.get("origin"):
+                update_canonical_origin(target, record["origin"])
+            changed = changed or not dry_run
+        except Exception as exc:
+            log.error("git[%s]: local clone blocked: %s", peer, exc)
+
+    for record in local_only:
+        profile = cfg.git.for_repository(record.get("identity", ""))
+        if not profile.enabled or not profile.clone_missing:
+            continue
+        if record.get("identity") in remote_identities:
+            continue
+        if (
+            record.get("nested")
+            or record.get("kind") in ("submodule", "linked-worktree")
+        ):
+            log.info("git[%s]: missing nested/worktree checkout requires parent mapping: %s",
+                     peer, record.get("logical_path"))
+            continue
+        target = canonical_main_path(record, remote_manifest.get("roots", []))
+        origin = record.get("origin")
+        if not target or not origin:
+            continue
+        if len(remote_claims.get(os.path.normpath(target), [])) > 1:
+            log.error(
+                "git[%s]: peer bootstrap quarantined; multiple local "
+                "checkouts claim %s",
+                peer, target,
+            )
+            continue
+        log.info("git[%s]: initialize peer checkout %s", peer, target)
+        try:
+            _remote_json(
+                peer,
+                ["git-init-checkout", "--target", target, "--origin", origin]
+                + (["--dry-run"] if dry_run else []),
+            )
+            if not dry_run:
+                push_all_refs(record["real_path"], peer, target)
+                branch = record.get("branch")
+                if branch:
+                    _remote_json(
+                        peer,
+                        ["git-checkout-branch", "--repo", target,
+                         "--branch", branch],
+                    )
+                changed = True
+        except Exception as exc:
+            log.error("git[%s]: peer bootstrap blocked: %s", peer, exc)
+    return changed
+
+
+def _sync_git_refs(cfg: Config, peer: str, pairs, dry_run: bool) -> dict:
+    from .gittransport import fetch_branch, fetch_tag, push_branch
+    from .repoops import converge_branch, converge_tag
+    from .syncplan import branch_import_plan
+
+    result = {
+        "branches_equal": 0,
+        "fast_forwards": 0,
+        "branches_created": 0,
+        "diverged": 0,
+        "tags_created": 0,
+        "tag_conflicts": 0,
+        "errors": 0,
+    }
+    processed = set()
+    for pair in pairs:
+        profile = cfg.git.for_repository(pair.identity)
+        if not profile.enabled:
+            continue
+        local = pair.local
+        remote = pair.remote
+        ref_key = (
+            pair.identity,
+            local.get("common_dir"),
+            remote.get("common_dir"),
+        )
+        if ref_key in processed:
+            continue
+        processed.add(ref_key)
+        local_repo = local["real_path"]
+        remote_repo = remote["real_path"]
+        actions = (
+            branch_import_plan(
+                local.get("branches", {}),
+                remote.get("branches", {}),
+                cfg.directions,
+            )
+            if profile.sync_branches
+            else []
+        )
+        branch_conflicts = set()
+        for action in actions:
+            branch = action["branch"]
+            source_oid = action["source_oid"]
+            log.info("git[%s]: %s %s %s", peer, action["action"],
+                     pair.identity, branch)
+            if dry_run:
+                continue
+            try:
+                if action["action"] == "pull-ref":
+                    incoming = fetch_branch(
+                        local_repo, peer, remote_repo, branch, source_oid
+                    )
+                    detail = converge_branch(
+                        local_repo, branch, incoming, peer,
+                        create_resolution=True,
+                    )
+                    if detail["action"] == "resolution-worktree":
+                        branch_conflicts.add(branch)
+                else:
+                    incoming = push_branch(
+                        local_repo, peer, remote_repo, branch, source_oid,
+                        os.uname().nodename,
+                    )
+                    detail = _remote_json(
+                        peer,
+                        ["git-advance", "--repo", remote_repo,
+                         "--branch", branch, "--incoming-ref", incoming,
+                         "--peer", os.uname().nodename]
+                        + (["--no-resolution"] if branch in branch_conflicts else []),
+                    )
+                action_name = detail.get("action")
+                if action_name == "fast-forward":
+                    result["fast_forwards"] += 1
+                elif action_name == "created-branch":
+                    result["branches_created"] += 1
+                elif action_name in ("resolution-worktree", "diverged"):
+                    result["diverged"] += 1
+                elif action_name in ("equal", "local-ahead"):
+                    result["branches_equal"] += 1
+            except Exception as exc:
+                result["errors"] += 1
+                log.error("git[%s]: branch %s failed: %s", peer, branch, exc)
+
+        if not profile.sync_tags:
+            continue
+        local_tags = local.get("tags", {})
+        remote_tags = remote.get("tags", {})
+        for tag in sorted(set(local_tags) | set(remote_tags)):
+            loid, roid = local_tags.get(tag), remote_tags.get(tag)
+            if loid == roid:
+                continue
+            if roid and "pull" in cfg.directions:
+                if not dry_run:
+                    try:
+                        incoming = fetch_tag(local_repo, peer, remote_repo, tag, roid)
+                        detail = converge_tag(local_repo, tag, incoming)
+                        if detail["action"] == "created-tag":
+                            result["tags_created"] += 1
+                        elif detail["action"] == "tag-conflict":
+                            result["tag_conflicts"] += 1
+                    except Exception as exc:
+                        result["errors"] += 1
+                        log.error("git[%s]: pull tag %s failed: %s", peer, tag, exc)
+            if loid and "push" in cfg.directions:
+                if not dry_run:
+                    try:
+                        incoming = push_branch(
+                            local_repo, peer, remote_repo, "tag-" + tag, loid,
+                            os.uname().nodename,
+                        )
+                        detail = _remote_json(
+                            peer,
+                            ["git-update-tag", "--repo", remote_repo,
+                             "--tag", tag, "--incoming-ref", incoming],
+                        )
+                        if detail["action"] == "created-tag":
+                            result["tags_created"] += 1
+                        elif detail["action"] == "tag-conflict":
+                            result["tag_conflicts"] += 1
+                    except Exception as exc:
+                        result["errors"] += 1
+                        log.error("git[%s]: push tag %s failed: %s", peer, tag, exc)
+    return result
+
+
+def _sync_worktree_topology(cfg: Config, peer: str, local_manifest: dict,
+                            remote_manifest: dict, local_only, remote_only,
+                            dry_run: bool) -> dict:
+    from .repoops import ensure_branch_worktree
+
+    result = {"created": 0, "skipped": 0, "errors": 0}
+
+    def main_record(records, identity):
+        return next((
+            item for item in records
+            if item.get("identity") == identity
+            and item.get("kind") not in ("linked-worktree", "submodule")
+            and not item.get("bare")
+        ), None)
+
+    for source, destination_records, side in (
+        (local_only, remote_manifest["repositories"], "remote"),
+        (remote_only, local_manifest["repositories"], "local"),
+    ):
+        for record in source:
+            profile = cfg.git.for_repository(record.get("identity", ""))
+            if not profile.enabled or not profile.sync_worktrees:
+                continue
+            if record.get("kind") != "linked-worktree" or not record.get("branch"):
+                continue
+            destination = main_record(destination_records, record["identity"])
+            if destination is None:
+                result["skipped"] += 1
+                continue
+            log.info(
+                "git[%s]: ensure %s worktree %s for %s",
+                peer, side, record["branch"], record["identity"],
+            )
+            try:
+                if side == "local":
+                    detail = ensure_branch_worktree(
+                        destination["real_path"], record["branch"], dry_run=dry_run
+                    )
+                else:
+                    detail = _remote_json(
+                        peer,
+                        ["git-ensure-worktree", "--repo", destination["real_path"],
+                         "--branch", record["branch"]]
+                        + (["--dry-run"] if dry_run else []),
+                    )
+                if detail.get("created"):
+                    result["created"] += 1
+            except Exception as exc:
+                result["errors"] += 1
+                log.error("git[%s]: worktree creation blocked: %s", peer, exc)
+    return result
+
+
+def _transfer_wip(cfg: Config, peer: str, pair, action: dict,
+                  profile) -> dict:
+    local_repo = pair.local["real_path"]
+    remote_repo = pair.remote["real_path"]
+    apply_flag = bool(action["apply"] and profile.auto_apply)
+    if action["action"] == "pull-wip":
+        send_args = ssh_argv(peer, remote_chatmesh_args(
+            ["git-wip-export", "--repo", remote_repo]
+        ))
+        send_env = None
+        receive_args = [
+            sys.executable, "-m", "chatmesh", "git-wip-import",
+            "--repo", local_repo, "--peer", peer,
+        ] + (["--apply"] if apply_flag else [])
+        receive_env = dict(os.environ, PYTHONPATH=repo_root())
+    else:
+        send_args = [
+            sys.executable, "-m", "chatmesh", "git-wip-export",
+            "--repo", local_repo,
+        ]
+        send_env = dict(os.environ, PYTHONPATH=repo_root())
+        receive_args = ssh_argv(peer, remote_chatmesh_args(
+            ["git-wip-import", "--repo", remote_repo,
+             "--peer", os.uname().nodename]
+            + (["--apply"] if apply_flag else [])
+        ))
+        receive_env = None
+
+    # Export and import are deliberately sequential. A streaming shell pipeline
+    # can let an importer consume a partial/non-archive payload when snapshot
+    # creation fails (for example, for an unmerged index).
+    with tempfile.TemporaryFile() as archive:
+        send = subprocess.run(
+            send_args,
+            stdout=archive,
+            env=send_env,
+        )
+        if send.returncode:
+            return {
+                "ok": False,
+                "reason": "snapshot-export-failed",
+                "send_returncode": send.returncode,
+                "recv_returncode": None,
+            }
+        archive.seek(0)
+        recv = subprocess.run(
+            receive_args,
+            stdin=archive,
+            stdout=subprocess.PIPE,
+            env=receive_env,
+        )
+    parsed = _last_json(recv.stdout)
+    if recv.returncode or parsed is None:
+        return {
+            "ok": False,
+            "reason": "snapshot-import-failed",
+            "send_returncode": send.returncode,
+            "recv_returncode": recv.returncode,
+        }
+    return parsed
+
+
+def sync_git(cfg: Config, peer: str, state: dict, dry_run: bool) -> None:
+    from .syncplan import match_repositories, wip_transfer_plan
+
+    try:
+        remote_manifest = _remote_json(
+            peer, ["git-manifest"] + (["--no-cache"] if dry_run else []),
+            timeout=1800,
+        )
+        local_manifest = _local_git_manifest(cfg, dry_run)
+    except Exception as exc:
+        log.error("git[%s]: manifest failed: %s", peer, exc)
+        mark(state, peer, "git", "sync", ok=False, error=str(exc))
+        return
+
+    for side, manifest in (
+        ("local", local_manifest),
+        ("remote", remote_manifest),
+    ):
+        for error in manifest.get("errors", []):
+            log.error(
+                "git[%s]: %s repository unavailable: %s: %s",
+                peer,
+                side,
+                error.get("logical_path", "(unknown)"),
+                error.get("error", "inventory failed"),
+            )
+
+    if _sync_repo_layout(
+        cfg, peer, local_manifest, remote_manifest, dry_run
+    ) and not dry_run:
+        remote_manifest = _remote_json(peer, ["git-manifest"], timeout=1800)
+        local_manifest = _local_git_manifest(cfg)
+
+    pairs, local_only, remote_only, ambiguities = match_repositories(
+        local_manifest["repositories"], remote_manifest["repositories"]
+    )
+    log.info(
+        "git[%s]: matched=%d local-only=%d remote-only=%d ambiguous=%d",
+        peer, len(pairs), len(local_only), len(remote_only), len(ambiguities),
+    )
+    for ambiguity in ambiguities:
+        log.error(
+            "git[%s]: ambiguous %s (%s): local=%s remote=%s",
+            peer,
+            ambiguity.identity,
+            ambiguity.reason,
+            [item.get("logical_path") for item in ambiguity.local],
+            [item.get("logical_path") for item in ambiguity.remote],
+        )
+    if _bootstrap_missing_repositories(
+        cfg, peer, local_manifest, remote_manifest,
+        local_only, remote_only, dry_run,
+    ) and not dry_run:
+        remote_manifest = _remote_json(peer, ["git-manifest"], timeout=1800)
+        local_manifest = _local_git_manifest(cfg)
+        pairs, local_only, remote_only, ambiguities = match_repositories(
+            local_manifest["repositories"], remote_manifest["repositories"]
+        )
+
+    ref_result = _sync_git_refs(cfg, peer, pairs, dry_run)
+    worktree_result = _sync_worktree_topology(
+        cfg, peer, local_manifest, remote_manifest,
+        local_only, remote_only, dry_run,
+    )
+    if worktree_result["created"] and not dry_run:
+        remote_manifest = _remote_json(peer, ["git-manifest"], timeout=1800)
+        local_manifest = _local_git_manifest(cfg)
+        pairs, local_only, remote_only, ambiguities = match_repositories(
+            local_manifest["repositories"], remote_manifest["repositories"]
+        )
+    wip_counts = {"transferred": 0, "applied": 0, "quarantined": 0, "errors": 0}
+    for pair in pairs:
+        profile = cfg.git.for_repository(pair.identity)
+        if not profile.enabled:
+            continue
+        if pair.local.get("bare") or pair.remote.get("bare"):
+            continue
+        for action in wip_transfer_plan(pair.local, pair.remote, cfg.directions):
+            log.info(
+                "git[%s]: %s %s apply=%s reason=%s",
+                peer, action["action"], pair.identity,
+                action["apply"] and profile.auto_apply, action["reason"],
+            )
+            if dry_run:
+                continue
+            detail = _transfer_wip(cfg, peer, pair, action, profile)
+            if detail.get("ok"):
+                wip_counts["transferred"] += 1
+                if detail.get("quarantined"):
+                    wip_counts["quarantined"] += 1
+                else:
+                    wip_counts["applied"] += 1
+            else:
+                wip_counts["errors"] += 1
+                log.error(
+                    "git[%s]: %s %s failed: %s",
+                    peer, action["action"], pair.identity,
+                    detail.get("reason", "snapshot transfer failed"),
+                )
+    detail = {
+        "ok": (
+            ref_result["errors"] == 0
+            and wip_counts["errors"] == 0
+            and not local_manifest.get("errors")
+            and not remote_manifest.get("errors")
+        ),
+        "matched": len(pairs),
+        "local_only": len(local_only),
+        "remote_only": len(remote_only),
+        "ambiguous": len(ambiguities),
+        "inventory_errors": (
+            len(local_manifest.get("errors", []))
+            + len(remote_manifest.get("errors", []))
+        ),
+        **ref_result,
+        **{"worktrees_" + key: value for key, value in worktree_result.items()},
+        **{"wip_" + key: value for key, value in wip_counts.items()},
+        "dry_run": dry_run,
+    }
+    mark(state, peer, "git", "sync", **detail)
+
+
+# --------------------------------------------------------------------------- #
+# User-level preferences
+# --------------------------------------------------------------------------- #
+def _remote_apply_preferences(peer: str, plan: dict) -> dict:
+    proc = subprocess.run(
+        ssh_argv(peer, remote_chatmesh_args(["preferences-apply"])),
+        input=json.dumps(plan, sort_keys=True).encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=900,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "remote preference apply failed: %s"
+            % proc.stderr.decode("utf-8", "replace").strip()[:1000]
+        )
+    parsed = _last_json(proc.stdout)
+    if parsed is None:
+        raise RuntimeError("remote preference apply returned no result")
+    return parsed
+
+
+def sync_preferences(cfg: Config, peer: str, state: dict,
+                     dry_run: bool) -> None:
+    from .preferenceops import (
+        apply_preference_plan,
+        converged_baseline,
+        load_baseline,
+        plan_snapshots,
+        rewrite_snapshot_home,
+        snapshot_preferences,
+        write_baseline,
+    )
+    from .util import home
+
+    try:
+        local = snapshot_preferences(cfg)
+        remote = _remote_json(peer, ["preferences-export"], timeout=900)
+        local_home = home()
+        remote_home_value = str(remote["home"])
+        remote_local = rewrite_snapshot_home(remote, local_home)
+        base_local = load_baseline(cfg, peer, local_home)
+
+        pull_plan = plan_snapshots(base_local, local, remote_local)
+        base_remote = rewrite_snapshot_home(base_local, remote_home_value)
+        local_remote = rewrite_snapshot_home(local, remote_home_value)
+        push_plan = plan_snapshots(base_remote, remote, local_remote)
+        log.info(
+            "preferences[%s]: pull=%s push=%s blocked(local=%d remote=%d)",
+            peer,
+            pull_plan["counts"],
+            push_plan["counts"],
+            len(local["manifest"].get("blocked", [])),
+            len(remote["manifest"].get("blocked", [])),
+        )
+        if dry_run:
+            mark(
+                state, peer, "preferences", "sync",
+                ok=True, dry_run=True,
+                pull=pull_plan["counts"], push=push_plan["counts"],
+            )
+            return
+
+        local_result = {"applied": [], "kept": [], "conflicts": []}
+        remote_result = {"applied": [], "kept": [], "conflicts": []}
+        if "pull" in cfg.directions:
+            local_result = apply_preference_plan(cfg, pull_plan)
+        if "push" in cfg.directions:
+            remote_result = _remote_apply_preferences(peer, push_plan)
+
+        # Re-scan after writes and retain old bases for unresolved conflicts.
+        final_local = snapshot_preferences(cfg)
+        final_remote = _remote_json(peer, ["preferences-export"], timeout=900)
+        final_remote_local = rewrite_snapshot_home(final_remote, local_home)
+        baseline = converged_baseline(
+            final_local, final_remote_local, base_local
+        )
+        write_baseline(cfg, peer, baseline)
+        mark(
+            state, peer, "preferences", "sync",
+            ok=True,
+            local_applied=len(local_result.get("applied", [])),
+            local_conflicts=len(local_result.get("conflicts", [])),
+            remote_applied=len(remote_result.get("applied", [])),
+            remote_conflicts=len(remote_result.get("conflicts", [])),
+            blocked_local=len(local["manifest"].get("blocked", [])),
+            blocked_remote=len(remote["manifest"].get("blocked", [])),
+        )
+    except Exception as exc:
+        log.error("preferences[%s]: %s", peer, exc)
+        mark(state, peer, "preferences", "sync", ok=False, error=str(exc))
+
+
+# --------------------------------------------------------------------------- #
 # Entry
 # --------------------------------------------------------------------------- #
 APP_UNITS = {
@@ -298,9 +998,9 @@ APP_UNITS = {
 def sync_all(cfg: Config, only_peer: Optional[str] = None,
              only_app: Optional[str] = None, dry_run: bool = False) -> None:
     if not cfg.peers:
-        log.warning("no peers configured (CHATMESH_PEERS) — nothing to do")
+        log.warning("no peers configured in config.toml — nothing to do")
         return
-    state = load_state()
+    state = load_state(cfg.state_dir)
     for peer in cfg.peers:
         if only_peer and peer != only_peer:
             continue
@@ -309,11 +1009,20 @@ def sync_all(cfg: Config, only_peer: Optional[str] = None,
         except Exception as e:
             log.error("peer %s unreachable: %s", peer, e)
             continue
-        try:
-            ensure_deployed(peer)
-        except Exception as e:
-            log.error("peer %s: deploy failed: %s", peer, e)
-            continue
+        if dry_run:
+            rv = deployed_version(peer)
+            if rv != VERSION:
+                log.error(
+                    "peer %s: dry-run cannot deploy; peer has %s, need %s",
+                    peer, rv or "none", VERSION,
+                )
+                continue
+        else:
+            try:
+                ensure_deployed(peer)
+            except Exception as e:
+                log.error("peer %s: deploy failed: %s", peer, e)
+                continue
         for app in cfg.apps:
             if only_app and app != only_app:
                 continue
@@ -327,5 +1036,19 @@ def sync_all(cfg: Config, only_peer: Optional[str] = None,
                         sync_history(cfg, peer, rhome, unit, state, dry_run)
                 except Exception as e:
                     log.exception("%s/%s[%s] failed: %s", app, unit, peer, e)
-        save_state(state)
+        if cfg.git.enabled and (only_app is None or only_app == "git"):
+            try:
+                sync_git(cfg, peer, state, dry_run)
+            except Exception as e:
+                log.exception("git[%s] failed: %s", peer, e)
+        if (
+            cfg.preferences.enabled
+            and (only_app is None or only_app == "preferences")
+        ):
+            try:
+                sync_preferences(cfg, peer, state, dry_run)
+            except Exception as e:
+                log.exception("preferences[%s] failed: %s", peer, e)
+        if not dry_run:
+            save_state(state, cfg.state_dir)
     log.info("sync complete")

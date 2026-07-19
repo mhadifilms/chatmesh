@@ -1,88 +1,157 @@
 # chatmesh
 
-Multi-way sync of **agentic chat history** between Macs with different
-usernames: Cursor IDE chats, Cursor CLI (`cursor-agent`) chats, Claude Code
-sessions, and Codex sessions — with every absolute path, database reference,
-and directory name rewritten for the destination machine's home directory.
-
-Built from (and superseding) the old `cursor-sync` script and the
-`repo-reorg` Cursor-DB migration engine. Unlike `cursor-sync`, the Cursor
-database is **merged row-by-row** (chats from both machines coexist), not
-replaced wholesale.
+Chatmesh synchronizes agent chats, Git repositories and exact work-in-progress,
+and curated AI-tool preferences between Macs with different home paths. The
+machine running `chatmesh sync` is the hub and drives both SSH directions; a
+peer never needs SSH access back to the hub.
 
 ## What syncs
 
-| App | Data | Method |
-|---|---|---|
-| Cursor IDE | `globalStorage/state.vscdb` composers | row-level merge, newest `lastUpdatedAt` wins per chat; workspace ids remapped, stub `workspace.json` created for unknown projects |
-| Cursor CLI | `~/.cursor/chats/<md5(cwd)>/<session>/store.db` | file copy via sqlite online backup; outer dir renamed to `md5(rewritten cwd)` |
-| Claude Code | `~/.claude/projects/**`, `~/.claude/history.jsonl` | per-file newer-wins with path rewrite + project dir rename; history = line union |
-| Codex | `~/.codex/sessions/**`, `~/.codex/history.jsonl` | per-file newer-wins with path rewrite; history = line union |
+- Cursor IDE composers are merged row-by-row in `state.vscdb`; workspace IDs
+  and home paths are remapped without replacing the database.
+- Cursor CLI, Claude Code, and Codex sessions retain the existing guarded
+  file-tree/history merge behavior.
+- Every Git repository below the configured roots is discovered recursively,
+  including nested repositories, submodules, bare repositories, linked
+  worktrees, and owner-directory symlinks.
+- Local branches, tags, upstream metadata, worktree branches, unpushed commits,
+  and configured WIP categories are synchronized with Git plumbing.
+- Curated Cursor, Claude, Codex, and custom user preference paths use hash-based
+  three-way merge rather than mtime.
 
-Checkpoint/restore blobs (`agentKv:*`, `checkpointId:*` — tens of GB of file
-snapshots) are excluded by default; the full conversation, diffs, and context
-still sync. `CHATMESH_SYNC_CHECKPOINTS=1` includes the per-composer checkpoint
-rows (the blob CAS itself is not synced in v0.1, so cross-machine "restore
-checkpoint" is unsupported).
+Project `.cursor`, `.claude`, `.codex`, `.agents`, `AGENTS.md`, and
+`CLAUDE.md` files belong to the Git WIP snapshot. Preference adapters only own
+user-level paths.
 
-## Safety rules
+## Safety model
 
-- **Never deletes** anything, anywhere. Rows/files are only added or replaced.
-- Every replaced DB row / file is backed up first under
-  `~/.local/state/chatmesh/backups/`.
-- Cursor's DB is written **only when Cursor is closed on the destination**
-  (the source may be open — sqlite WAL reads are snapshot-consistent).
-- Any session file modified in the last `CHATMESH_FILE_GUARD_MINUTES` (15 by
-  default) on either side is left alone, so live sessions are never touched.
-- A lock file prevents overlapping runs; interrupted syncs resume cleanly
-  (a chat's header row is committed last, so a partial chat is re-fetched).
-- Known behavior: deleting a chat on one machine does not delete it elsewhere —
-  the next sync resurrects it (there are no deletion tombstones to observe).
+- Git objects arrive through Git's smart protocol under
+  `refs/chatmesh/incoming/...`; `.git`, indexes, refs, and worktree metadata are
+  never copied as files.
+- A clean checkout advances only through `git merge --ff-only`; an unmounted
+  branch uses compare-and-swap `git update-ref`.
+- Diverged histories do not move either original branch. Chatmesh creates a
+  `mhadi/chore/chatmesh-resolve-*` branch and worktree under `.worktrees/` with
+  a reviewable merge or normal conflict state. `chatmesh git accept` verifies
+  that the committed resolution includes the incoming history.
+- WIP archives preserve staged binary patches, unstaged and untracked bytes,
+  deletions, executable modes, and safe relative symlinks. Apply requires the
+  same repository identity, branch, HEAD, and a clean destination or an exact
+  previously accepted Chatmesh snapshot.
+- Active Git operations, locks, unmerged indexes, oversized payloads, symlink
+  escapes, path traversal, and concurrent edits are quarantined. Unrecognized
+  live content is never overwritten.
+- Every accepted WIP apply is backed up and journaled; preference writes are
+  backed up and atomically replaced. Recovery commands are fail-closed.
+- Preference inventory excludes credentials, token/auth stores, keychains,
+  caches, downloaded plugins/runtimes, vendor trees, managed skills, project
+  trust/state, and literal secret values. MCP secrets must be environment
+  references.
+- Cursor's narrowly allow-listed global user-rule value is read or written only
+  while Cursor is closed; no whole settings row is copied.
 
-## Topology
+## Configuration
 
-Hub model: the machine that runs `chatmesh sync` drives **both** directions
-(pull *and* push) for each peer over ssh, so only the hub needs ssh access to
-peers. With N peers configured, chats propagate transitively through the hub.
-Peers get the `chatmesh` code auto-deployed to `~/.local/share/chatmesh/repo`
-(re-deployed automatically on version change).
+`~/.config/chatmesh/config.toml` is the only user configuration source.
+`CHATMESH_HOME` and `CHATMESH_ASSUME_CLOSED` exist only for fixtures. Python
+3.9 and 3.10 use Chatmesh's bundled TOML fallback.
 
-## Setup
+```toml
+version = 1
+
+[mesh]
+peers = ["mhadi-mini"]
+apps = ["cursor", "cursor-cli", "claude", "codex"]
+directions = ["pull", "push"]
+interval = 3600
+file_guard_minutes = 15
+process_gate_apps = ["cursor", "cursor-cli"]
+sync_checkpoints = false
+max_composers_per_run = 0
+log_level = "INFO"
+state_dir = "~/.local/state/chatmesh"
+
+[git]
+enabled = true
+roots = ["~/Documents/GitHub"]
+branches = true
+tags = true
+worktrees = true
+clone_missing = true
+relocate = true
+staged = true
+unstaged = true
+untracked = true
+ignored = false
+auto_apply = true
+max_file_bytes = 52428800
+max_snapshot_bytes = 1073741824
+conflict_policy = "quarantine"
+
+[[git.repositories]]
+identity = "github-id:R_example"
+auto_apply = false
+
+[preferences]
+enabled = true
+cursor = true
+claude = true
+codex = true
+conflict_policy = "quarantine"
+max_file_bytes = 10485760
+max_total_bytes = 104857600
+exclude = []
+
+[[preferences.custom_paths]]
+name = "future-tool"
+path = "~/.future-tool/preferences"
+kind = "tree"
+rewrite_home = true
+exclude = ["cache/**"]
+```
+
+Repository overrides are matched by the stable identity shown by
+`chatmesh git list --json`. GitHub's current owner/name controls canonical
+`<root>/<owner>/<repo>` paths. Symlinked owner roots remain symlinked.
+
+## Setup and rollout
+
+Peers are SSH aliases from `~/.ssh/config`. Initialize and validate both
+machines before enabling scheduled writes:
 
 ```sh
-bin/chatmesh init      # writes ~/.config/chatmesh/env — set CHATMESH_PEERS
-bin/chatmesh doctor    # verify ssh, peer DBs, deployment
+bin/chatmesh init
+bin/chatmesh config validate
+bin/chatmesh deploy --peer mhadi-mini
+bin/chatmesh doctor
 bin/chatmesh sync --dry-run
-bin/chatmesh install   # LaunchAgent: runs at login + every CHATMESH_INTERVAL
+bin/chatmesh install
 ```
 
-Peers are **ssh host aliases** — usernames/IPs live in `~/.ssh/config`, e.g.:
-
-```
-Host my-mini
-  HostName 100.x.y.z       # e.g. the peer's Tailscale IP
-  User someuser
-  IdentityFile ~/.ssh/id_ed25519
-```
-
-## Config (`~/.config/chatmesh/env`, overridable via environment)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `CHATMESH_PEERS` | — | comma-separated ssh hosts |
-| `CHATMESH_APPS` | `cursor,cursor-cli,claude,codex` | what to sync |
-| `CHATMESH_DIRECTIONS` | `pull,push` | limit to one direction if desired |
-| `CHATMESH_INTERVAL` | `3600` | LaunchAgent period (s); syncs are no-ops when nothing changed |
-| `CHATMESH_FILE_GUARD_MINUTES` | `15` | active-session guard window |
-| `CHATMESH_PROCESS_GATE_APPS` | `cursor,cursor-cli` | apps that skip sync entirely while running (add `claude`/`codex` for strict gating) |
-| `CHATMESH_SYNC_CHECKPOINTS` | `0` | include checkpoint rows (see above) |
-| `CHATMESH_MAX_COMPOSERS_PER_RUN` | `0` | cap Cursor chats per run (0 = all) |
-
-## Ops
+The explicit one-time old-config migration archives the env file:
 
 ```sh
-bin/chatmesh status              # last results per peer/app/direction + gates
-tail -f ~/.local/state/chatmesh/logs/chatmesh.log
-bin/chatmesh sync --app cursor --peer my-mini
-bin/chatmesh deploy --peer my-mini   # force re-push code to peer
+bin/chatmesh config migrate --from ~/.config/chatmesh/env
 ```
+
+A dry run does not deploy code, update sync state, cache GitHub resolution, or
+write repositories/preferences. Deploy the same version first.
+
+## Operations
+
+```sh
+bin/chatmesh status
+bin/chatmesh sync --app git --peer mhadi-mini --dry-run
+bin/chatmesh git list
+bin/chatmesh git status
+bin/chatmesh git show --snapshot /path/to/snapshot.zip
+bin/chatmesh git accept --repo /path/to/repo --branch dev \
+  --resolution mhadi/chore/chatmesh-resolve-example
+bin/chatmesh git recover --repo /path/to/repo --journal /path/to/journal.json
+bin/chatmesh preferences list
+bin/chatmesh preferences conflicts
+```
+
+Logs, backups, inboxes, baselines, and conflict records live below
+`~/.local/state/chatmesh/` unless `mesh.state_dir` changes it. Chatmesh never
+pushes to GitHub and never force-updates a live branch or tag.

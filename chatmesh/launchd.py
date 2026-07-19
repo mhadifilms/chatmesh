@@ -1,5 +1,4 @@
-"""LaunchAgent install so sync runs at login and every CHATMESH_INTERVAL
-seconds, surviving restarts."""
+"""LaunchAgent install using the interval from config.toml."""
 
 from __future__ import annotations
 
@@ -7,7 +6,7 @@ import os
 import plistlib
 import subprocess
 
-from .config import STATE_DIR
+from .config import default_state_dir
 from .util import log
 
 LABEL = "com.mhadifilms.chatmesh"
@@ -18,16 +17,17 @@ def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def install(interval: int) -> None:
+def install(interval: int, state_dir: str = "") -> None:
+    state_dir = state_dir or default_state_dir()
     os.makedirs(os.path.dirname(PLIST), exist_ok=True)
-    os.makedirs(os.path.join(STATE_DIR, "logs"), exist_ok=True)
+    os.makedirs(os.path.join(state_dir, "logs"), exist_ok=True)
     plist = {
         "Label": LABEL,
         "ProgramArguments": [os.path.join(_repo_root(), "bin", "chatmesh"), "sync"],
         "RunAtLoad": True,
         "StartInterval": interval,
-        "StandardOutPath": os.path.join(STATE_DIR, "logs", "launchd.out"),
-        "StandardErrorPath": os.path.join(STATE_DIR, "logs", "launchd.err"),
+        "StandardOutPath": os.path.join(state_dir, "logs", "launchd.out"),
+        "StandardErrorPath": os.path.join(state_dir, "logs", "launchd.err"),
         "EnvironmentVariables": {
             "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
         },
