@@ -459,6 +459,39 @@ def _prepare_canonical_parent(target: str, dry_run: bool = False) -> str:
     return owner_path
 
 
+def _nearest_existing_directory(path: str) -> str:
+    candidate = os.path.abspath(path)
+    while not os.path.isdir(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            raise RepositoryLayoutError(
+                "no existing destination ancestor for %s" % path
+            )
+        candidate = parent
+    return os.path.realpath(candidate)
+
+
+def _relocation_destination_anchor(target: str, linked_worktree: bool) -> str:
+    """Return an existing directory on the eventual destination filesystem."""
+    parent = os.path.dirname(target)
+    if linked_worktree:
+        return _nearest_existing_directory(parent)
+    owner_path = parent
+    root = os.path.dirname(owner_path)
+    if not os.path.isdir(root):
+        raise RepositoryLayoutError(
+            "repository root does not exist: %s" % root
+        )
+    if os.path.isdir(owner_path):
+        return os.path.realpath(owner_path)
+    storage_root = _owner_storage_root(root)
+    return os.path.realpath(storage_root or root)
+
+
+def _device(path: str) -> int:
+    return os.stat(path).st_dev
+
+
 def relocate_repository(repo: gitrepos.GitRepository, target: str,
                         dry_run: bool = False) -> dict:
     source = repo.logical_path
@@ -482,16 +515,19 @@ def relocate_repository(repo: gitrepos.GitRepository, target: str,
     except ValueError:
         pass
     parent = os.path.dirname(target)
-    if repo.kind != "linked-worktree":
-        _prepare_canonical_parent(target, dry_run=dry_run)
-    if dry_run:
-        return {"ok": True, "moved": True, "dry_run": True,
-                "source": source, "target": target}
-    os.makedirs(parent, exist_ok=True)
-    if os.stat(source).st_dev != os.stat(parent).st_dev:
+    destination_anchor = _relocation_destination_anchor(
+        target, repo.kind == "linked-worktree"
+    )
+    if _device(source) != _device(destination_anchor):
         raise RepositoryLayoutError(
             "cross-device repository relocation requires explicit repo-reorg"
         )
+    if dry_run:
+        return {"ok": True, "moved": True, "dry_run": True,
+                "source": source, "target": target}
+    if repo.kind != "linked-worktree":
+        _prepare_canonical_parent(target)
+    os.makedirs(parent, exist_ok=True)
 
     if repo.kind == "linked-worktree":
         main = gitrepos.list_worktrees(repo)[0].path

@@ -134,6 +134,28 @@ class RepositoryOpsTests(unittest.TestCase):
             self.assertTrue(result["dry_run"])
             self.assertFalse(os.path.lexists(os.path.dirname(target)))
 
+    def test_cross_device_relocation_fails_before_creating_owner_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "GitHub")
+            source = os.path.join(root, "OldOwner", "Repo")
+            target = os.path.join(root, "NewOwner", "Repo")
+            os.makedirs(source)
+            git(source, "init")
+
+            def device(path):
+                return 1 if os.path.realpath(path) == os.path.realpath(source) else 2
+
+            with mock.patch.object(repoops, "_device", side_effect=device):
+                with self.assertRaisesRegex(
+                    repoops.RepositoryLayoutError, "cross-device"
+                ):
+                    repoops.relocate_repository(
+                        gitrepos.open_repository(source), target
+                    )
+
+            self.assertTrue(os.path.isdir(source))
+            self.assertFalse(os.path.lexists(os.path.dirname(target)))
+
     def test_relocation_is_blocked_by_active_git_lock(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, "GitHub")
