@@ -90,6 +90,23 @@ def main(argv=None) -> int:
     environment_sub.add_parser(
         "pending", help="list quarantined environment snapshots and plans"
     )
+    p = sub.add_parser(
+        "mesh", help="mesh chats, skills, rules, and instructions across agents"
+    )
+    mesh_sub = p.add_subparsers(dest="mesh_cmd", required=True)
+    p = mesh_sub.add_parser(
+        "run", help="materialize the configured local agent mesh"
+    )
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p = mesh_sub.add_parser(
+        "doctor", help="check cross-agent skill links for drift"
+    )
+    p.add_argument("--json", action="store_true")
+    p = mesh_sub.add_parser(
+        "agents", help="list supported agent resource layouts"
+    )
+    p.add_argument("--json", action="store_true")
 
     sub.add_parser("export-cursor-index")
     p = sub.add_parser("export-cursor-rows")
@@ -153,6 +170,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("environment-apply")
     p.add_argument("--peer", required=True)
     p.add_argument("--force", action="store_true")
+    p = sub.add_parser("agent-mesh-run")
+    p.add_argument("--dry-run", action="store_true")
 
     args = ap.parse_args(argv)
     try:
@@ -188,7 +207,10 @@ def main(argv=None) -> int:
         print("peers: %s | apps: %s" % (",".join(cfg.peers), ",".join(cfg.apps)))
         for app in cfg.apps:
             print("  %-10s running locally: %s" % (app, app_running_local(app)))
-        print("  git sync: %s | preferences: %s | environment: %s" % (
+        print(
+            "  agent mesh: %s | git sync: %s | preferences: %s | "
+            "environment: %s" % (
+            "enabled" if cfg.agent_mesh.enabled else "disabled",
             "enabled" if cfg.git.enabled else "disabled",
             "enabled" if cfg.preferences.enabled else "disabled",
             "enabled" if cfg.environment.enabled else "disabled",
@@ -254,6 +276,8 @@ def main(argv=None) -> int:
         return run_preferences_command(cfg, args)
     if args.cmd == "environment":
         return run_environment_command(cfg, args)
+    if args.cmd == "mesh":
+        return run_mesh_command(cfg, args)
 
     if args.cmd == "deploy":
         from .sync import ensure_deployed
@@ -397,6 +421,12 @@ def main(argv=None) -> int:
                 cfg, args.peer, snapshot, force=args.force
             ),
             sort_keys=True,
+        ))
+        return 0
+    if args.cmd == "agent-mesh-run":
+        from .agentmesh import run_agent_mesh
+        print(json.dumps(
+            run_agent_mesh(cfg, dry_run=args.dry_run), sort_keys=True
         ))
         return 0
     return 1
@@ -777,6 +807,68 @@ def run_environment_command(cfg: Config, args) -> int:
     if args.environment_cmd == "pending":
         for path in list_pending(cfg):
             print(path)
+        return 0
+    return 1
+
+
+def run_mesh_command(cfg: Config, args) -> int:
+    from .agentmesh import AGENTS, doctor, run_agent_mesh
+
+    if args.mesh_cmd == "run":
+        result = run_agent_mesh(cfg, dry_run=args.dry_run)
+        if args.json:
+            print(json.dumps(result, sort_keys=True, indent=2))
+        elif not result.get("enabled"):
+            print("agent mesh is disabled; set agent_mesh.enabled = true")
+        else:
+            for section in ("messages", "skills", "manifests"):
+                detail = result.get(section)
+                if not isinstance(detail, dict):
+                    continue
+                counts = {
+                    key: len(value)
+                    for key, value in detail.items()
+                    if isinstance(value, list)
+                }
+                print("%-12s %s" % (section + ":", counts))
+        return 0
+    if args.mesh_cmd == "doctor":
+        result = doctor(cfg)
+        if args.json:
+            print(json.dumps(result, sort_keys=True, indent=2))
+        else:
+            print(
+                "agent mesh: %d healthy, %d issues"
+                % (len(result["healthy"]), len(result["issues"]))
+            )
+            for issue in result["issues"]:
+                print(
+                    "! %-10s %-30s %s"
+                    % (issue["agent"], issue["name"], issue["reason"])
+                )
+        return 0 if result["ok"] else 1
+    if args.mesh_cmd == "agents":
+        rows = [
+            {
+                "agent": agent,
+                "skills": list(spec["skills"]),
+                "rules": list(spec["rules"]),
+                "instruction": spec["instruction"],
+            }
+            for agent, spec in AGENTS.items()
+        ]
+        if args.json:
+            print(json.dumps(rows, sort_keys=True, indent=2))
+        else:
+            for row in rows:
+                print(
+                    "%-12s skills=%-34s rules=%s"
+                    % (
+                        row["agent"],
+                        ",".join(row["skills"]),
+                        ",".join(row["rules"]) or "-",
+                    )
+                )
         return 0
     return 1
 

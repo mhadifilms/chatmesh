@@ -9,6 +9,7 @@ from unittest import mock
 
 from chatmesh import tomlutil
 from chatmesh.config import (
+    AgentMeshProfile,
     CONFIG_PATH,
     EXAMPLE_TOML,
     Config,
@@ -55,6 +56,8 @@ class ConfigDefaultsTests(unittest.TestCase):
         self.assertFalse(cfg.preferences.codex)
         self.assertFalse(cfg.environment.enabled)
         self.assertFalse(cfg.environment.auto_apply)
+        self.assertFalse(cfg.agent_mesh.enabled)
+        self.assertTrue(cfg.agent_mesh.messages)
 
     def test_config_path_is_toml_and_fixture_home_is_resolved_at_load_time(self):
         self.assertTrue(CONFIG_PATH.endswith(".config/chatmesh/config.toml"))
@@ -93,6 +96,7 @@ class ConfigDefaultsTests(unittest.TestCase):
             PreferencesProfile,
             CustomPreferencePath,
             EnvironmentProfile,
+            AgentMeshProfile,
         ):
             self.assertTrue(is_dataclass(value))
         self.assertIs(Config, MeshConfig)
@@ -250,6 +254,11 @@ class ConfigValidationTests(unittest.TestCase):
             ({"mesh": {"typo": True}}, "unknown key"),
             ({"git": {"enabled": "yes"}}, "boolean"),
             ({"preferences": {"cursor": 1}}, "boolean"),
+            ({"agent_mesh": {"enabled": "yes"}}, "boolean"),
+            (
+                {"agent_mesh": {"resource_agents": ["unknown"]}},
+                "unsupported agent",
+            ),
         )
         for document, message in cases:
             with self.subTest(document=document):

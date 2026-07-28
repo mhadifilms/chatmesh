@@ -30,7 +30,7 @@ from .util import (app_running_local, app_running_remote, log, remote_chatmesh_c
                    remote_chatmesh_args, remote_home, run, ssh_argv, ssh_out)
 
 TREE_APP = {"claude-projects": "claude", "codex-sessions": "codex",
-            "cursor-cli": "cursor-cli"}
+            "cursor-cli": "cursor-cli", "agent-skills": "agent-mesh"}
 HISTORY_APP = {"claude-history": "claude", "codex-history": "codex"}
 
 
@@ -198,10 +198,11 @@ def sync_tree(cfg: Config, peer: str, rhome: str, tree: str, state: dict,
         return
     lman = filetrees.manifest(tree)
     lhome = os.path.expanduser("~")
+    guard_sec = 0 if tree == "agent-skills" else cfg.file_guard_sec
     pull = filetrees.plan_transfers(tree, rman, lman, rhome, lhome,
-                                    cfg.file_guard_sec)
+                                    guard_sec)
     push = filetrees.plan_transfers(tree, lman, rman, lhome, rhome,
-                                    cfg.file_guard_sec)
+                                    guard_sec)
     log.info("%s[%s]: pull=%d push=%d files", tree, peer, len(pull), len(push))
     if dry_run:
         return
@@ -216,7 +217,7 @@ def sync_tree(cfg: Config, peer: str, rhome: str, tree: str, state: dict,
             recv = subprocess.Popen(
                 [sys.executable, "-m", "chatmesh", "files-recv", "--tree", tree,
                  "--src-home", rhome, "--backup", backup_dir(cfg.state_dir),
-                 "--guard", str(cfg.file_guard_sec)],
+                 "--guard", str(guard_sec)],
                 stdin=send.stdout, stdout=subprocess.PIPE,
                 env=dict(os.environ, PYTHONPATH=repo_root()))
             _pipe_json(send, pull)
@@ -238,7 +239,7 @@ def sync_tree(cfg: Config, peer: str, rhome: str, tree: str, state: dict,
                 ssh_argv(peer, remote_chatmesh_cmd(
                     'files-recv --tree %s --src-home "%s" '
                     '--backup "$HOME/.local/state/chatmesh/backups" --guard %d'
-                    % (tree, lhome, cfg.file_guard_sec))),
+                    % (tree, lhome, guard_sec))),
                 stdin=send.stdout, stdout=subprocess.PIPE)
             _pipe_json(send, push)
             out, _ = recv.communicate()
@@ -1141,8 +1142,16 @@ APP_UNITS = {
 
 def sync_all(cfg: Config, only_peer: Optional[str] = None,
              only_app: Optional[str] = None, dry_run: bool = False) -> None:
+    if cfg.agent_mesh.enabled and (
+        only_app is None or only_app in ("agent-mesh", "claude", "codex")
+    ):
+        from .agentmesh import run_agent_mesh
+        local_mesh = run_agent_mesh(cfg, dry_run=dry_run)
+        log.info("agent-mesh[local]: %s", local_mesh)
     if not cfg.peers:
-        log.warning("no peers configured in config.toml — nothing to do")
+        log.warning(
+            "no peers configured in config.toml — local agent mesh complete"
+        )
         return
     state = load_state(cfg.state_dir)
     for peer in cfg.peers:
@@ -1168,8 +1177,12 @@ def sync_all(cfg: Config, only_peer: Optional[str] = None,
                 log.error("peer %s: deploy failed: %s", peer, e)
                 continue
         for app in cfg.apps:
-            if only_app and app != only_app:
-                continue
+            if only_app:
+                if only_app == "agent-mesh":
+                    if app not in ("claude", "codex"):
+                        continue
+                elif app != only_app:
+                    continue
             for kind, unit in APP_UNITS.get(app, []):
                 try:
                     if kind == "db":
@@ -1180,6 +1193,17 @@ def sync_all(cfg: Config, only_peer: Optional[str] = None,
                         sync_history(cfg, peer, rhome, unit, state, dry_run)
                 except Exception as e:
                     log.exception("%s/%s[%s] failed: %s", app, unit, peer, e)
+        if (
+            cfg.agent_mesh.enabled
+            and cfg.agent_mesh.skills
+            and (only_app is None or only_app == "agent-mesh")
+        ):
+            try:
+                sync_tree(
+                    cfg, peer, rhome, "agent-skills", state, dry_run
+                )
+            except Exception as e:
+                log.exception("agent-skills[%s] failed: %s", peer, e)
         if cfg.git.enabled and (only_app is None or only_app == "git"):
             try:
                 sync_git(cfg, peer, state, dry_run)
@@ -1201,6 +1225,40 @@ def sync_all(cfg: Config, only_peer: Optional[str] = None,
                 sync_environment(cfg, peer, state, dry_run)
             except Exception as e:
                 log.exception("environment[%s] failed: %s", peer, e)
+        if (
+            cfg.agent_mesh.enabled
+            and (only_app is None or only_app in (
+                "agent-mesh", "claude", "codex",
+            ))
+        ):
+            try:
+                from .agentmesh import run_agent_mesh
+                local_result = run_agent_mesh(cfg, dry_run=dry_run)
+                remote_result = _remote_json(
+                    peer,
+                    ["agent-mesh-run"] + (["--dry-run"] if dry_run else []),
+                    timeout=1800,
+                )
+                mark(
+                    state, peer, "agent-mesh", "sync", ok=True,
+                    dry_run=dry_run,
+                    local_conflicts=sum(
+                        len(section.get("conflicts", []))
+                        for section in local_result.values()
+                        if isinstance(section, dict)
+                    ),
+                    remote_conflicts=sum(
+                        len(section.get("conflicts", []))
+                        for section in remote_result.values()
+                        if isinstance(section, dict)
+                    ),
+                )
+            except Exception as e:
+                log.exception("agent-mesh[%s] failed: %s", peer, e)
+                mark(
+                    state, peer, "agent-mesh", "sync",
+                    ok=False, error=str(e),
+                )
         if not dry_run:
             save_state(state, cfg.state_dir)
     log.info("sync complete")

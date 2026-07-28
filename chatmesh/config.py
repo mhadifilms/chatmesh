@@ -19,6 +19,10 @@ REMOTE_REPO = ".local/share/chatmesh/repo"  # relative to remote $HOME
 VALID_DIRECTIONS = frozenset(("pull", "push"))
 CONFLICT_POLICIES = frozenset(("quarantine", "manual", "keep-both", "skip"))
 CUSTOM_PATH_KINDS = frozenset(("file", "tree"))
+AGENT_MESH_AGENTS = frozenset((
+    "claude", "codex", "cursor", "opencode", "gemini",
+    "antigravity", "copilot", "windsurf",
+))
 
 
 class ConfigError(ValueError):
@@ -211,6 +215,23 @@ class EnvironmentProfile:
 
 
 @dataclass
+class AgentMeshProfile:
+    """Opt-in local Claude/Codex chat and cross-agent resource meshing."""
+
+    enabled: bool = False
+    messages: bool = True
+    skills: bool = True
+    rules: bool = True
+    instructions: bool = True
+    resource_agents: List[str] = field(
+        default_factory=lambda: ["claude", "codex", "cursor"]
+    )
+    roots: List[str] = field(default_factory=lambda: [_default_github_root()])
+    max_session_bytes: int = 50 * 1024 * 1024
+    conflict_policy: str = "quarantine"
+
+
+@dataclass
 class MeshConfig:
     """Complete validated Chatmesh configuration."""
 
@@ -231,6 +252,7 @@ class MeshConfig:
     git: GitProfile = field(default_factory=GitProfile)
     preferences: PreferencesProfile = field(default_factory=PreferencesProfile)
     environment: EnvironmentProfile = field(default_factory=EnvironmentProfile)
+    agent_mesh: AgentMeshProfile = field(default_factory=AgentMeshProfile)
 
     @property
     def git_profile(self) -> GitProfile:
@@ -262,7 +284,10 @@ class MeshConfig:
             raise ConfigError("configuration must be a TOML table")
         _reject_unknown(
             document,
-            {"version", "mesh", "git", "preferences", "environment"},
+            {
+                "version", "mesh", "git", "preferences", "environment",
+                "agent_mesh",
+            },
             "root",
         )
         version = document.get("version", 1)
@@ -278,6 +303,9 @@ class MeshConfig:
         )
         environment_data = _mapping(
             document.get("environment", {}), "environment"
+        )
+        agent_mesh_data = _mapping(
+            document.get("agent_mesh", {}), "agent_mesh"
         )
         return cls(
             peers=_string_list(mesh.get("peers", []), "mesh.peers"),
@@ -314,6 +342,7 @@ class MeshConfig:
             git=_parse_git_profile(git_data),
             preferences=_parse_preferences_profile(preferences_data),
             environment=_parse_environment_profile(environment_data),
+            agent_mesh=_parse_agent_mesh_profile(agent_mesh_data),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -388,9 +417,23 @@ class MeshConfig:
             "max_lock_file_bytes": self.environment.max_lock_file_bytes,
             "conflict_policy": self.environment.conflict_policy,
         }
+        agent_mesh: Dict[str, Any] = {
+            "enabled": self.agent_mesh.enabled,
+            "messages": self.agent_mesh.messages,
+            "skills": self.agent_mesh.skills,
+            "rules": self.agent_mesh.rules,
+            "instructions": self.agent_mesh.instructions,
+            "resource_agents": list(self.agent_mesh.resource_agents),
+            "roots": [
+                _portable_path(path) for path in self.agent_mesh.roots
+            ],
+            "max_session_bytes": self.agent_mesh.max_session_bytes,
+            "conflict_policy": self.agent_mesh.conflict_policy,
+        }
         return {
             "version": 1,
             "mesh": mesh,
+            "agent_mesh": agent_mesh,
             "git": git,
             "preferences": preferences,
             "environment": environment,
@@ -918,6 +961,68 @@ def _parse_custom_path(value: Any, index: int) -> CustomPreferencePath:
         max_file_bytes=_optional_int(data, "max_file_bytes", label),
         conflict_policy=policy,
         exclude=_string_list(data.get("exclude", []), "%s.exclude" % label),
+    )
+
+
+def _parse_agent_mesh_profile(
+    data: Mapping[str, Any],
+) -> AgentMeshProfile:
+    allowed = {
+        "enabled",
+        "messages",
+        "skills",
+        "rules",
+        "instructions",
+        "resource_agents",
+        "roots",
+        "max_session_bytes",
+        "conflict_policy",
+    }
+    _reject_unknown(data, allowed, "agent_mesh")
+    agents = _string_list(
+        data.get("resource_agents", ["claude", "codex", "cursor"]),
+        "agent_mesh.resource_agents",
+    )
+    invalid = sorted(set(agents) - AGENT_MESH_AGENTS)
+    if invalid:
+        raise ConfigError(
+            "agent_mesh.resource_agents contains unsupported agent%s: %s"
+            % ("" if len(invalid) == 1 else "s", ", ".join(invalid))
+        )
+    roots_text = _string_list(
+        data.get("roots", ["~/Documents/GitHub"]), "agent_mesh.roots"
+    )
+    roots = [
+        _absolute_path(root, "agent_mesh.roots[%d]" % index)
+        for index, root in enumerate(roots_text)
+    ]
+    enabled = _boolean(data.get("enabled", False), "agent_mesh.enabled")
+    if enabled and not agents:
+        raise ConfigError(
+            "agent_mesh.resource_agents must not be empty when enabled"
+        )
+    if enabled and not roots:
+        raise ConfigError("agent_mesh.roots must not be empty when enabled")
+    return AgentMeshProfile(
+        enabled=enabled,
+        messages=_boolean(
+            data.get("messages", True), "agent_mesh.messages"
+        ),
+        skills=_boolean(data.get("skills", True), "agent_mesh.skills"),
+        rules=_boolean(data.get("rules", True), "agent_mesh.rules"),
+        instructions=_boolean(
+            data.get("instructions", True), "agent_mesh.instructions"
+        ),
+        resource_agents=agents,
+        roots=roots,
+        max_session_bytes=_integer(
+            data.get("max_session_bytes", 50 * 1024 * 1024),
+            "agent_mesh.max_session_bytes",
+        ),
+        conflict_policy=_conflict_policy(
+            data.get("conflict_policy", "quarantine"),
+            "agent_mesh.conflict_policy",
+        ),
     )
 
 

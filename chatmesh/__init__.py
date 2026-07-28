@@ -1,3 +1,3 @@
-"""Non-destructive Git, agent-state, and environment sync between Macs."""
+"""A local-first conversation mesh across AI agents and Macs."""
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
