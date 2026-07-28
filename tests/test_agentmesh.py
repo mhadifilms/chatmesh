@@ -139,6 +139,55 @@ class MessageMeshTests(unittest.TestCase):
             self.assertEqual(len(second["conflicts"]), 1)
             self.assertIn("continued", destination.read_text(encoding="utf-8"))
 
+    def test_tool_heavy_source_is_streamed_and_limit_bounds_visible_text(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = (
+                Path(temp) / ".codex/sessions/2026/01/02/tool-heavy.jsonl"
+            )
+            records = [{
+                "timestamp": "2026-01-02T03:04:05Z",
+                "type": "session_meta",
+                "payload": {"id": "tool-heavy", "cwd": "/tmp/repo"},
+            }]
+            records.extend({
+                "timestamp": "2026-01-02T03:04:06Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "tool output " * 100,
+                },
+            } for _index in range(20))
+            records.extend([
+                {
+                    "timestamp": "2026-01-02T03:04:07Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "question"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-01-02T03:04:08Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "answer"}],
+                    },
+                },
+            ])
+            write_jsonl(source, records)
+            self.assertGreater(source.stat().st_size, 64)
+
+            session = read_codex_session(str(source), 64)
+            self.assertEqual(
+                [message["text"] for message in session["messages"]],
+                ["question", "answer"],
+            )
+            with self.assertRaisesRegex(
+                ValueError, "projected conversation exceeds"
+            ):
+                read_codex_session(str(source), 8)
+
 
 class ResourceMeshTests(unittest.TestCase):
     def config(self, home: str, roots=None) -> Config:

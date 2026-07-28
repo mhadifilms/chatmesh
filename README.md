@@ -68,7 +68,9 @@ deterministically identified projection:
 - an unchanged projection can be refreshed as its source conversation grows;
 - once a user continues or edits the imported session, Chatmesh preserves it
   and quarantines later source changes instead of overwriting them;
-- session size is bounded by `agent_mesh.max_session_bytes`.
+- source JSONL is parsed one record at a time, so large tool outputs do not
+  block a chat; retained human-visible text per projected session is bounded
+  by `agent_mesh.max_session_bytes`.
 
 The original native session is always retained.
 

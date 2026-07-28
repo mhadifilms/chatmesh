@@ -24,7 +24,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from . import VERSION
 from .config import AgentMeshProfile, Config, home_dir
@@ -90,10 +90,8 @@ def _marker(source_agent: str, source_id: str) -> dict:
     }
 
 
-def _json_lines(path: str, limit: int) -> List[dict]:
-    if os.path.getsize(path) > limit:
-        raise ValueError("session exceeds max_session_bytes")
-    records = []
+def _json_lines(path: str) -> Iterator[dict]:
+    """Yield JSONL objects without retaining tool-heavy source records."""
     with open(path, "r", encoding="utf-8", errors="replace") as stream:
         for number, line in enumerate(stream, 1):
             if not line.strip():
@@ -103,12 +101,7 @@ def _json_lines(path: str, limit: int) -> List[dict]:
             except json.JSONDecodeError as exc:
                 raise ValueError("invalid JSONL at line %d: %s" % (number, exc))
             if isinstance(value, dict):
-                records.append(value)
-    return records
-
-
-def _is_import(records: Sequence[dict]) -> bool:
-    return bool(records and isinstance(records[0].get(MESH_KEY), dict))
+                yield value
 
 
 def _text_blocks(value, allowed: Iterable[str]) -> List[str]:
@@ -127,14 +120,34 @@ def _text_blocks(value, allowed: Iterable[str]) -> List[str]:
     return out
 
 
+def _append_message(
+    messages: List[dict], role: str, text: str, timestamp: object,
+    retained_bytes: int, limit: int,
+) -> int:
+    retained_bytes += len(text.encode("utf-8"))
+    if limit and retained_bytes > limit:
+        raise ValueError(
+            "projected conversation exceeds max_session_bytes"
+        )
+    messages.append({
+        "role": role,
+        "text": text,
+        "timestamp": timestamp,
+    })
+    return retained_bytes
+
+
 def read_claude_session(path: str, limit: int) -> Optional[dict]:
-    records = _json_lines(path, limit)
-    if _is_import(records):
-        return None
     messages = []
     cwd = None
     session_id = None
-    for record in records:
+    retained_bytes = 0
+    first_record = True
+    for record in _json_lines(path):
+        if first_record:
+            first_record = False
+            if isinstance(record.get(MESH_KEY), dict):
+                return None
         cwd = cwd or record.get("cwd")
         session_id = session_id or record.get("sessionId")
         kind = record.get("type")
@@ -154,11 +167,10 @@ def read_claude_session(path: str, limit: int) -> Optional[dict]:
         else:
             texts = _text_blocks(message.get("content"), ("text",))
         if texts:
-            messages.append({
-                "role": kind,
-                "text": "\n\n".join(texts),
-                "timestamp": record.get("timestamp"),
-            })
+            retained_bytes = _append_message(
+                messages, kind, "\n\n".join(texts),
+                record.get("timestamp"), retained_bytes, limit,
+            )
     if not messages:
         return None
     source_id = str(session_id or os.path.splitext(os.path.basename(path))[0])
@@ -171,48 +183,71 @@ def read_claude_session(path: str, limit: int) -> Optional[dict]:
 
 
 def read_codex_session(path: str, limit: int) -> Optional[dict]:
-    records = _json_lines(path, limit)
-    if _is_import(records):
-        return None
     cwd = None
     session_id = None
     messages = []
-    for record in records:
+    fallback_messages = []
+    retained_bytes = 0
+    fallback_bytes = 0
+    fallback_too_large = False
+    first_record = True
+    for record in _json_lines(path):
+        if first_record:
+            first_record = False
+            if isinstance(record.get(MESH_KEY), dict):
+                return None
         payload = record.get("payload")
         if not isinstance(payload, dict):
             continue
         if record.get("type") == "session_meta":
             cwd = cwd or payload.get("cwd")
             session_id = session_id or payload.get("id") or payload.get("session_id")
-        if record.get("type") != "response_item" or payload.get("type") != "message":
+        if (
+            record.get("type") == "response_item"
+            and payload.get("type") == "message"
+        ):
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            allowed = ("input_text",) if role == "user" else ("output_text",)
+            texts = _text_blocks(payload.get("content"), allowed)
+            if texts:
+                if not messages:
+                    fallback_messages = []
+                    fallback_bytes = 0
+                    fallback_too_large = False
+                retained_bytes = _append_message(
+                    messages, role, "\n\n".join(texts),
+                    record.get("timestamp"), retained_bytes, limit,
+                )
             continue
-        role = payload.get("role")
-        if role not in ("user", "assistant"):
+        if (
+            record.get("type") != "event_msg"
+            or messages
+            or fallback_too_large
+        ):
             continue
-        allowed = ("input_text",) if role == "user" else ("output_text",)
-        texts = _text_blocks(payload.get("content"), allowed)
-        if texts:
-            messages.append({
-                "role": role,
-                "text": "\n\n".join(texts),
-                "timestamp": record.get("timestamp"),
-            })
+        kind = payload.get("type")
+        role = "user" if kind == "user_message" else (
+            "assistant" if kind == "agent_message" else None
+        )
+        text = payload.get("message")
+        if role and isinstance(text, str) and text.strip():
+            try:
+                fallback_bytes = _append_message(
+                    fallback_messages, role, text,
+                    record.get("timestamp"), fallback_bytes, limit,
+                )
+            except ValueError:
+                fallback_messages = []
+                fallback_too_large = True
     if not messages:
         # Older Codex rollouts may only retain the display event stream.
-        for record in records:
-            payload = record.get("payload")
-            if record.get("type") != "event_msg" or not isinstance(payload, dict):
-                continue
-            kind = payload.get("type")
-            role = "user" if kind == "user_message" else (
-                "assistant" if kind == "agent_message" else None
+        if fallback_too_large:
+            raise ValueError(
+                "projected conversation exceeds max_session_bytes"
             )
-            text = payload.get("message")
-            if role and isinstance(text, str) and text.strip():
-                messages.append({
-                    "role": role, "text": text,
-                    "timestamp": record.get("timestamp"),
-                })
+        messages = fallback_messages
     if not messages:
         return None
     source_id = str(session_id or os.path.splitext(os.path.basename(path))[0])
@@ -361,12 +396,31 @@ def _encode_records(records: Sequence[dict]) -> bytes:
     ).encode("utf-8")
 
 
-def _owned_projection(path: str, expected: Mapping[str, object], limit: int) -> bool:
+def _owned_projection(path: str, expected: Mapping[str, object]) -> bool:
+    found = False
     try:
-        records = _json_lines(path, limit)
+        for record in _json_lines(path):
+            found = True
+            if record.get(MESH_KEY) != expected:
+                return False
     except (OSError, ValueError):
         return False
-    return bool(records) and all(record.get(MESH_KEY) == expected for record in records)
+    return found
+
+
+def _file_matches_bytes(path: str, data: bytes) -> bool:
+    try:
+        if os.path.getsize(path) != len(data):
+            return False
+        offset = 0
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                if chunk != data[offset:offset + len(chunk)]:
+                    return False
+                offset += len(chunk)
+        return offset == len(data)
+    except OSError:
+        return False
 
 
 def _atomic_write(path: str, data: bytes) -> None:
@@ -456,9 +510,7 @@ def mesh_messages(
             _assert_safe_parent(actual_home, destination)
             expected = _marker(agent, str(session["id"]))
             if os.path.exists(destination):
-                with open(destination, "rb") as stream:
-                    existing = stream.read(profile.max_session_bytes + 1)
-                if existing == data:
+                if _file_matches_bytes(destination, data):
                     result["kept"].append({"source": source, "destination": destination})
                     continue
                 if os.path.getmtime(destination) > cutoff:
@@ -472,9 +524,7 @@ def mesh_messages(
                             "reason": "destination session is active",
                         })
                     continue
-                if not _owned_projection(
-                    destination, expected, profile.max_session_bytes
-                ):
+                if not _owned_projection(destination, expected):
                     if not dry_run:
                         result["conflicts"].append(_message_conflict(
                             cfg, source, destination,
