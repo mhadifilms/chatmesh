@@ -242,6 +242,29 @@ class GitReposTest(unittest.TestCase):
         with self.assertRaises(gitrepos.UnsafeSnapshotError):
             gitrepos.apply_wip_snapshot(destination, snapshot)
 
+    def test_ds_store_is_not_transferred_as_untracked_wip(self) -> None:
+        source = self.init_repo(self.root / "metadata-source")
+        (source / ".DS_Store").write_bytes(b"source finder metadata")
+        (source / "payload.txt").write_text("real WIP\n")
+
+        archive = self.root / "metadata-wip.zip"
+        snapshot = gitrepos.create_wip_snapshot(source, archive)
+        entries = {entry["path"]: entry for entry in snapshot.manifest["entries"]}
+        self.assertNotIn(".DS_Store", entries)
+        self.assertIn("payload.txt", entries)
+
+        destination = self.root / "metadata-destination"
+        self.git(self.root, "clone", str(source), str(destination))
+        (destination / ".DS_Store").write_bytes(b"destination finder metadata")
+
+        result = gitrepos.apply_wip_snapshot(destination, snapshot)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual((destination / "payload.txt").read_text(), "real WIP\n")
+        self.assertEqual(
+            (destination / ".DS_Store").read_bytes(), b"destination finder metadata"
+        )
+
     def test_wip_category_toggles_project_only_selected_state(self) -> None:
         source = self.init_repo(self.root / "category-source")
         (source / ".gitignore").write_text("ignored.txt\n")

@@ -7,6 +7,20 @@ from chatmesh import sync
 
 
 class SyncTests(unittest.TestCase):
+    def test_quarantined_wip_is_not_counted_as_transfer_error(self):
+        counts = {"transferred": 0, "applied": 0, "quarantined": 0, "errors": 0}
+
+        recorded = sync._record_wip_result(
+            counts,
+            {"ok": False, "quarantined": True, "reason": "unrecorded state"},
+        )
+
+        self.assertTrue(recorded)
+        self.assertEqual(
+            counts,
+            {"transferred": 1, "applied": 0, "quarantined": 1, "errors": 0},
+        )
+
     def test_wip_import_never_starts_after_export_failure(self):
         pair = SimpleNamespace(
             local={"real_path": "/local/repo"},

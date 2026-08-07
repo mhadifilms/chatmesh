@@ -92,7 +92,9 @@ def _quick_wip_id(
                 repo.real_path,
                 ["ls-files", "--others", "--exclude-standard", "-z", "--"],
             ).stdout.split(b"\x00")
-            if item
+            if item and not gitrepos.is_wip_metadata_path(
+                item.decode("utf-8", "surrogateescape")
+            )
         )
     if include_ignored:
         selected.extend(
@@ -102,7 +104,9 @@ def _quick_wip_id(
                 ["ls-files", "--others", "--ignored", "--exclude-standard",
                  "-z", "--"],
             ).stdout.split(b"\x00")
-            if item
+            if item and not gitrepos.is_wip_metadata_path(
+                item.decode("utf-8", "surrogateescape")
+            )
         )
     for category, raw in sorted(selected):
         rel = raw.decode("utf-8", "surrogateescape")

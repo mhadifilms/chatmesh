@@ -29,6 +29,15 @@ SNAPSHOT_FORMAT = "chatmesh-wip-v1"
 _FS_ENCODING = os.sys.getfilesystemencoding()
 _SAFE_REF_COMPONENT = re.compile(r"[^A-Za-z0-9._-]+")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# Finder metadata is machine-local noise, not user WIP.  Keep this list
+# intentionally small: tracked files and all other untracked paths retain the
+# configured synchronization behavior.
+WIP_METADATA_NAMES = frozenset((".DS_Store",))
+
+
+def is_wip_metadata_path(path: str) -> bool:
+    """Return whether an untracked path is known machine-local metadata."""
+    return os.path.basename(path) in WIP_METADATA_NAMES
 
 
 class GitRepoError(RuntimeError):
@@ -832,22 +841,26 @@ def _changed_paths(
             ).stdout
         )
     )
-    untracked = set(
-        _split_nul(
+    untracked = {
+        path
+        for path in _split_nul(
             _git(
                 repo, ["ls-files", "--others", "--exclude-standard", "-z", "--"]
             ).stdout
         )
-    )
-    ignored = set(
-        _split_nul(
+        if not is_wip_metadata_path(path)
+    }
+    ignored = {
+        path
+        for path in _split_nul(
             _git(
                 repo,
                 ["ls-files", "--others", "--ignored", "--exclude-standard",
                  "-z", "--"],
             ).stdout
         )
-    )
+        if not is_wip_metadata_path(path)
+    }
     return staged, unstaged, untracked, ignored
 
 

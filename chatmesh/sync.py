@@ -91,8 +91,9 @@ def ensure_deployed(peer: str, force: bool = False) -> None:
         return
     log.info("deploying chatmesh %s to %s (had: %s)", VERSION, peer, rv or "none")
     tar = subprocess.Popen(
-        ["tar", "-c", "--exclude", ".git", "--exclude", "__pycache__",
-         "--exclude", "*.pyc", "-C", repo_root(), "."],
+        ["tar", "-c", "--exclude", ".git", "--exclude", ".worktrees",
+         "--exclude", "__pycache__", "--exclude", "*.pyc", "-C",
+         repo_root(), "."],
         stdout=subprocess.PIPE)
     run(ssh_argv(peer, 'mkdir -p "$HOME/%s" && tar -x -C "$HOME/%s"'
                  % (REMOTE_REPO, REMOTE_REPO)), stdin=tar.stdout)
@@ -770,6 +771,20 @@ def _transfer_wip(cfg: Config, peer: str, pair, action: dict,
     return parsed
 
 
+def _record_wip_result(counts: dict, detail: dict) -> bool:
+    """Classify a received WIP archive without treating safe quarantine as failure."""
+    if detail.get("quarantined"):
+        counts["transferred"] += 1
+        counts["quarantined"] += 1
+        return True
+    if detail.get("ok"):
+        counts["transferred"] += 1
+        counts["applied"] += 1
+        return True
+    counts["errors"] += 1
+    return False
+
+
 def sync_git(cfg: Config, peer: str, state: dict, dry_run: bool) -> None:
     from .syncplan import match_repositories, wip_transfer_plan
 
@@ -856,14 +871,14 @@ def sync_git(cfg: Config, peer: str, state: dict, dry_run: bool) -> None:
             if dry_run:
                 continue
             detail = _transfer_wip(cfg, peer, pair, action, profile)
-            if detail.get("ok"):
-                wip_counts["transferred"] += 1
-                if detail.get("quarantined"):
-                    wip_counts["quarantined"] += 1
-                else:
-                    wip_counts["applied"] += 1
+            if _record_wip_result(wip_counts, detail):
+                if detail.get("quarantined") and not detail.get("ok"):
+                    log.warning(
+                        "git[%s]: %s %s quarantined: %s",
+                        peer, action["action"], pair.identity,
+                        detail.get("reason", "destination conflict"),
+                    )
             else:
-                wip_counts["errors"] += 1
                 log.error(
                     "git[%s]: %s %s failed: %s",
                     peer, action["action"], pair.identity,
