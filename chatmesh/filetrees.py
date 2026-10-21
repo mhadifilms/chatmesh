@@ -43,6 +43,9 @@ TREES = {
     "claude-projects": {"root": "~/.claude/projects", "rewrite": True, "rename": "claude"},
     "codex-sessions": {"root": "~/.codex/sessions", "rewrite": True, "rename": None},
     "cursor-cli": {"root": "~/.cursor/chats", "rewrite": False, "rename": "md5cwd", "sqlite": True},
+    # Canonical cross-agent skills. Destination-specific symlinks are
+    # materialized locally by agentmesh after this tree converges.
+    "agent-skills": {"root": "~/.agents/skills", "rewrite": True, "rename": None},
 }
 HISTORY_FILES = {
     "claude-history": "~/.claude/history.jsonl",
